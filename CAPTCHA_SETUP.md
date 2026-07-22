@@ -25,6 +25,7 @@ CAPMONSTER_RELAY_PORT=3210
 CAPMONSTER_AUTO_SUBMIT=false
 PADDLE_OCR_ENABLED=true
 PADDLE_OCR_MIN_CONFIDENCE=0
+PADDLE_OCR_VERBOSE=false
 CAPMONSTER_FALLBACK_ENABLED=false
 ```
 
@@ -49,6 +50,19 @@ connect to `127.0.0.1` if the browser asks.
 The userscript sends each four-character CAPTCHA to the local relay. PaddleOCR
 fills the input; verification mode leaves final submission to you unless
 `CAPMONSTER_AUTO_SUBMIT=true` is explicitly enabled.
+
+When the automatic cycle is started with `Ctrl+Shift+V`, a recognized CAPTCHA
+is submitted automatically even when the global auto-submit setting is off.
+The script then fills the service, location and applicant-count fields, waits
+without a fixed timeout for either date options or an explicit site error, and
+selects a matching or the first available date. An explicit no-slots/load error
+starts a fresh `Wiza krajowa` cycle.
+
+Hotkeys:
+
+- `Ctrl+Shift+V` — start or resume automatic mode with the loaded preset.
+- `Ctrl+Shift+Z` — immediately restart from `Wiza krajowa`.
+- `Ctrl+Shift+X` — stop automatic retries.
 
 ## Dataset rule
 

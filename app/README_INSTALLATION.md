@@ -152,6 +152,8 @@ Wiza krajowa - korzystanie z uprawnień wynikających z posiadania Karty Polaka
 | Клавиша | Действие |
 |---------|----------|
 | **Ctrl+Shift+V** | Запустить автоматизацию (если пресет загружен) |
+| **Ctrl+Shift+Z** | Перезапустить цикл через Wiza krajowa |
+| **Ctrl+Shift+X** | Остановить автоматические повторы |
 | **F12** | Открыть консоль для просмотра логов |
 
 ---

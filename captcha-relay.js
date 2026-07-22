@@ -20,6 +20,7 @@ const CAPMONSTER_MODULE = String(process.env.CAPMONSTER_MODULE || '').trim();
 const CAPMONSTER_FALLBACK_ENABLED = String(process.env.CAPMONSTER_FALLBACK_ENABLED || 'false').toLowerCase() === 'true';
 const PADDLE_OCR_ENABLED = String(process.env.PADDLE_OCR_ENABLED || 'true').toLowerCase() !== 'false';
 const PADDLE_OCR_MIN_CONFIDENCE = Number(process.env.PADDLE_OCR_MIN_CONFIDENCE || 0);
+const PADDLE_OCR_VERBOSE = String(process.env.PADDLE_OCR_VERBOSE || 'false').toLowerCase() === 'true';
 const AUTO_SUBMIT = String(process.env.CAPMONSTER_AUTO_SUBMIT || 'false').toLowerCase() === 'true';
 const CAPMONSTER_API = 'https://api.capmonster.cloud';
 
@@ -168,7 +169,7 @@ function getPaddleWorker() {
       else request.resolve(result);
     });
     readline.createInterface({ input: child.stderr }).on('line', line => {
-      if (line && !line.includes('ccache')) console.error(`[paddleocr] ${line}`);
+      if (PADDLE_OCR_VERBOSE && line && !line.includes('ccache')) console.error(`[paddleocr] ${line}`);
     });
     child.on('error', reject);
     child.on('exit', code => {
@@ -197,10 +198,16 @@ async function solveWithPaddle(base64, expectedLength) {
   const confidence = Number(result.confidence || 0);
   console.log(`[paddleocr] ${text.length} chars, confidence ${confidence.toFixed(3)}, ${result.elapsedMs} ms`);
   if (!text || (expectedLength && text.length !== expectedLength)) {
-    throw new Error(`PaddleOCR returned ${text.length} characters`);
+    throw Object.assign(
+      new Error(`PaddleOCR returned ${text.length} characters`),
+      { expectedMiss: true },
+    );
   }
   if (confidence < PADDLE_OCR_MIN_CONFIDENCE) {
-    throw new Error(`PaddleOCR confidence ${confidence.toFixed(3)} is below ${PADDLE_OCR_MIN_CONFIDENCE}`);
+    throw Object.assign(
+      new Error(`PaddleOCR confidence ${confidence.toFixed(3)} is below ${PADDLE_OCR_MIN_CONFIDENCE}`),
+      { expectedMiss: true },
+    );
   }
   return { text, taskId: null, cost: 0, provider: 'paddleocr', confidence };
 }
@@ -325,32 +332,46 @@ async function solveWithCapMonster(base64, expectedLength) {
 async function solveDeduplicated(image, expectedLength) {
   const { base64, bytes } = normalizeImage(image);
   const hash = crypto.createHash('sha256').update(bytes).digest('hex');
+  const cacheKey = `${hash}:${expectedLength || 0}`;
   const now = Date.now();
 
   for (const [key, value] of solveCache) {
     if (value.expiresAt <= now) solveCache.delete(key);
   }
 
-  const cached = solveCache.get(hash);
+  const cached = solveCache.get(cacheKey);
   if (cached) {
     console.log(`[cache ${hash.slice(0, 8)}] reused`);
     return cached.promise;
   }
 
   const promise = (async () => {
+    let localError = null;
     if (PADDLE_OCR_ENABLED) {
       try {
         return await solveWithPaddle(base64, expectedLength);
       } catch (error) {
-        console.log(`[paddleocr] local solve failed: ${error.message}`);
+        localError = error;
+        if (CAPMONSTER_FALLBACK_ENABLED) {
+          console.log(`[paddleocr] local solve failed, trying fallback: ${error.message}`);
+        }
       }
     }
     if (!CAPMONSTER_FALLBACK_ENABLED) {
-      throw new Error('Local PaddleOCR could not produce an accepted answer; CapMonster fallback is disabled');
+      if (localError && !localError.expectedMiss) {
+        throw Object.assign(localError, { statusCode: 502 });
+      }
+      throw Object.assign(
+        new Error('PaddleOCR could not confidently recognize this CAPTCHA'),
+        { statusCode: 422, quiet: true },
+      );
     }
     return solveWithCapMonster(base64, expectedLength);
   })();
-  solveCache.set(hash, { expiresAt: now + CACHE_TTL_MS, promise });
+  solveCache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, promise });
+  promise.catch(() => {
+    if (solveCache.get(cacheKey)?.promise === promise) solveCache.delete(cacheKey);
+  });
   return promise;
 }
 
@@ -403,8 +424,11 @@ const server = http.createServer(async (req, res) => {
     const solution = await solveDeduplicated(body.image, expectedLength);
     jsonResponse(res, 200, { ok: true, autoSubmit: AUTO_SUBMIT, ...solution });
   } catch (error) {
-    console.error(`[relay] ${error.message}`);
-    jsonResponse(res, error.statusCode || 502, { ok: false, error: error.message });
+    const statusCode = error.statusCode || 502;
+    if (!error.quiet && statusCode >= 500) {
+      console.error(`[relay] ${error.message}`);
+    }
+    jsonResponse(res, statusCode, { ok: false, error: error.message });
   }
 });
 
@@ -414,5 +438,5 @@ server.listen(PORT, HOST, () => {
   console.log(`CapMonster module: ${CAPMONSTER_MODULE || 'universal'}`);
   console.log(`CapMonster fallback: ${CAPMONSTER_FALLBACK_ENABLED ? 'enabled' : 'disabled'}`);
   console.log(`PaddleOCR: ${PADDLE_OCR_ENABLED ? `enabled (min confidence ${PADDLE_OCR_MIN_CONFIDENCE})` : 'disabled'}`);
-  console.log(`CAPTCHA auto-submit: ${AUTO_SUBMIT ? 'enabled' : 'disabled (verification mode)'}`);
+  console.log(`CAPTCHA auto-submit outside userscript automation: ${AUTO_SUBMIT ? 'enabled' : 'disabled'}`);
 });
