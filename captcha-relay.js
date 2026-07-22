@@ -10,19 +10,14 @@ loadEnv(ENV_PATH);
 
 const HOST = '127.0.0.1';
 const DATASET_DIR = path.join(__dirname, 'captcha-dataset');
-const PORT = Number(process.env.CAPMONSTER_RELAY_PORT || 3210);
+const PORT = Number(process.env.CAPTCHA_RELAY_PORT || 3210);
 const MAX_BODY_BYTES = 160_000;
 const MAX_IMAGE_BYTES = 50_000;
 const CACHE_TTL_MS = 2 * 60 * 1000;
-const MAX_TASKS_PER_HOUR = Number(process.env.CAPMONSTER_MAX_TASKS_PER_HOUR || 100);
-const CONFIDENCE_THRESHOLD = Number(process.env.CAPMONSTER_CONFIDENCE_THRESHOLD || 90);
-const CAPMONSTER_MODULE = String(process.env.CAPMONSTER_MODULE || '').trim();
-const CAPMONSTER_FALLBACK_ENABLED = String(process.env.CAPMONSTER_FALLBACK_ENABLED || 'false').toLowerCase() === 'true';
 const PADDLE_OCR_ENABLED = String(process.env.PADDLE_OCR_ENABLED || 'true').toLowerCase() !== 'false';
 const PADDLE_OCR_MIN_CONFIDENCE = Number(process.env.PADDLE_OCR_MIN_CONFIDENCE || 0);
 const PADDLE_OCR_VERBOSE = String(process.env.PADDLE_OCR_VERBOSE || 'false').toLowerCase() === 'true';
-const AUTO_SUBMIT = String(process.env.CAPMONSTER_AUTO_SUBMIT || 'false').toLowerCase() === 'true';
-const CAPMONSTER_API = 'https://api.capmonster.cloud';
+const AUTO_SUBMIT = String(process.env.CAPTCHA_AUTO_SUBMIT || 'false').toLowerCase() === 'true';
 
 function loadEnv(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -43,21 +38,9 @@ function loadEnv(filePath) {
   }
 }
 
-const API_KEY = process.env.CAPMONSTER_API_KEY || process.env.CAPMONSTER_API;
-if (CAPMONSTER_FALLBACK_ENABLED && !API_KEY) {
-  console.error('Missing CAPMONSTER_API (or CAPMONSTER_API_KEY) in .env');
-  process.exit(1);
-}
-
 const solveCache = new Map();
-const createdTaskTimes = [];
-let totalTasksCreated = 0;
 let paddleWorkerPromise = null;
 let paddleRequestId = 0;
-
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 function jsonResponse(res, statusCode, body) {
   const data = Buffer.from(JSON.stringify(body));
@@ -245,90 +228,6 @@ function saveCaptchaFeedback(body) {
   return { hash, correct: record.correct };
 }
 
-function enforceHourlyBudget() {
-  const cutoff = Date.now() - 60 * 60 * 1000;
-  while (createdTaskTimes.length && createdTaskTimes[0] < cutoff) {
-    createdTaskTimes.shift();
-  }
-  if (createdTaskTimes.length >= MAX_TASKS_PER_HOUR) {
-    throw Object.assign(
-      new Error(`Hourly safety limit reached (${MAX_TASKS_PER_HOUR} tasks)`),
-      { statusCode: 429 },
-    );
-  }
-}
-
-async function capMonsterRequest(endpoint, payload) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
-
-  try {
-    const response = await fetch(`${CAPMONSTER_API}/${endpoint}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    if (!response.ok) throw new Error(`CapMonster HTTP ${response.status}`);
-    return await response.json();
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function solveWithCapMonster(base64, expectedLength) {
-  enforceHourlyBudget();
-
-  const created = await capMonsterRequest('createTask', {
-    clientKey: API_KEY,
-    task: {
-      type: 'ImageToTextTask',
-      body: base64,
-      ...(CAPMONSTER_MODULE ? { capMonsterModule: CAPMONSTER_MODULE } : {}),
-      recognizingThreshold: CONFIDENCE_THRESHOLD,
-      case: true,
-      numeric: 0,
-      math: false,
-    },
-  });
-
-  if (created.errorId || !created.taskId) {
-    throw new Error(created.errorDescription || created.errorCode || 'Could not create task');
-  }
-
-  createdTaskTimes.push(Date.now());
-  totalTasksCreated += 1;
-  console.log(`[task ${created.taskId}] created (${createdTaskTimes.length}/${MAX_TASKS_PER_HOUR} this hour)`);
-
-  await delay(500);
-  const deadline = Date.now() + 12_000;
-
-  while (Date.now() < deadline) {
-    const result = await capMonsterRequest('getTaskResult', {
-      clientKey: API_KEY,
-      taskId: created.taskId,
-    });
-
-    if (result.errorId) {
-      throw new Error(result.errorDescription || result.errorCode || 'Could not get task result');
-    }
-
-    if (result.status === 'ready') {
-      const text = String(result.solution?.text || '').trim();
-      if (!text) throw new Error('CapMonster returned an empty answer');
-      if (expectedLength && text.length !== expectedLength) {
-        throw new Error(`Unexpected answer length: ${text.length}, expected ${expectedLength}`);
-      }
-      console.log(`[task ${created.taskId}] solved: ${text.length} characters`);
-      return { text, taskId: created.taskId, cost: result.cost || null, provider: 'capmonster' };
-    }
-
-    await delay(2000);
-  }
-
-  throw new Error('CapMonster result timeout');
-}
-
 async function solveDeduplicated(image, expectedLength) {
   const { base64, bytes } = normalizeImage(image);
   const hash = crypto.createHash('sha256').update(bytes).digest('hex');
@@ -346,27 +245,18 @@ async function solveDeduplicated(image, expectedLength) {
   }
 
   const promise = (async () => {
-    let localError = null;
-    if (PADDLE_OCR_ENABLED) {
-      try {
-        return await solveWithPaddle(base64, expectedLength);
-      } catch (error) {
-        localError = error;
-        if (CAPMONSTER_FALLBACK_ENABLED) {
-          console.log(`[paddleocr] local solve failed, trying fallback: ${error.message}`);
-        }
-      }
+    if (!PADDLE_OCR_ENABLED) {
+      throw Object.assign(new Error('PaddleOCR is disabled'), { statusCode: 503 });
     }
-    if (!CAPMONSTER_FALLBACK_ENABLED) {
-      if (localError && !localError.expectedMiss) {
-        throw Object.assign(localError, { statusCode: 502 });
-      }
+    try {
+      return await solveWithPaddle(base64, expectedLength);
+    } catch (error) {
+      if (!error.expectedMiss) throw Object.assign(error, { statusCode: 502 });
       throw Object.assign(
-        new Error('PaddleOCR could not confidently recognize this CAPTCHA'),
+        new Error(`PaddleOCR answer must contain exactly ${expectedLength} characters`),
         { statusCode: 422, quiet: true },
       );
     }
-    return solveWithCapMonster(base64, expectedLength);
   })();
   solveCache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, promise });
   promise.catch(() => {
@@ -390,11 +280,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/health') {
       jsonResponse(res, 200, {
         ok: true,
-        tasksCreated: totalTasksCreated,
-        tasksLastHour: createdTaskTimes.length,
-        hourlyLimit: MAX_TASKS_PER_HOUR,
-        module: CAPMONSTER_MODULE || 'universal',
-        capMonsterFallbackEnabled: CAPMONSTER_FALLBACK_ENABLED,
+        provider: 'paddleocr',
         paddleOcrEnabled: PADDLE_OCR_ENABLED,
         paddleOcrMinConfidence: PADDLE_OCR_MIN_CONFIDENCE,
       });
@@ -416,9 +302,9 @@ const server = http.createServer(async (req, res) => {
 
     assertAllowedRequest(req);
     const body = await readJson(req);
-    const expectedLength = Number(body.expectedLength || 0);
-    if (expectedLength && (!Number.isInteger(expectedLength) || expectedLength < 1 || expectedLength > 20)) {
-      throw Object.assign(new Error('Invalid expectedLength'), { statusCode: 400 });
+    const expectedLength = Number(body.expectedLength || 4);
+    if (expectedLength !== 4) {
+      throw Object.assign(new Error('This relay accepts only four-character CAPTCHAs'), { statusCode: 400 });
     }
 
     const solution = await solveDeduplicated(body.image, expectedLength);
@@ -434,9 +320,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`Captcha relay listening on http://${HOST}:${PORT}`);
-  console.log(`Budget guard: ${MAX_TASKS_PER_HOUR} new tasks/hour; duplicate images are cached for 2 minutes`);
-  console.log(`CapMonster module: ${CAPMONSTER_MODULE || 'universal'}`);
-  console.log(`CapMonster fallback: ${CAPMONSTER_FALLBACK_ENABLED ? 'enabled' : 'disabled'}`);
+  console.log('Local-only mode; duplicate images are cached for 2 minutes');
   console.log(`PaddleOCR: ${PADDLE_OCR_ENABLED ? `enabled (min confidence ${PADDLE_OCR_MIN_CONFIDENCE})` : 'disabled'}`);
   console.log(`CAPTCHA auto-submit outside userscript automation: ${AUTO_SUBMIT ? 'enabled' : 'disabled'}`);
 });

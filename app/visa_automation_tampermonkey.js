@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         e-konsulat Visa Automation
 // @namespace    http://tampermonkey.net/
-// @version      2.6
+// @version      2.7
 // @description  Быстрая автоматизация заполнения формы визы с импортом JSON пресета
 // @author       VisaBot
 // @match        *://secure.e-konsulat.gov.pl/*
@@ -32,6 +32,7 @@
       this.captchaCandidateSource = null;
       this.captchaCandidateSince = 0;
       this.captchaOcrNotBefore = Number(sessionStorage.getItem('visaCaptchaOcrNotBefore') || 0);
+      this.captchaReloadTimer = null;
       console.log('🔧 VisaAutomationUI constructor started');
 
       try {
@@ -330,6 +331,10 @@
         clearTimeout(this.retryTimer);
         this.retryTimer = null;
       }
+      if (this.captchaReloadTimer) {
+        clearTimeout(this.captchaReloadTimer);
+        this.captchaReloadTimer = null;
+      }
       if (message) this.log(`⏹️ ${message}`);
     }
 
@@ -420,6 +425,16 @@
           this.stopWaiting = false;
         }
       }, 1800);
+    }
+
+    reloadAfterCaptchaError(reason) {
+      if (this.captchaReloadTimer) return;
+      this.automationEnabled = true;
+      sessionStorage.setItem('visaAutomationEnabled', 'true');
+      this.captchaOcrNotBefore = Date.now() + 3500;
+      sessionStorage.setItem('visaCaptchaOcrNotBefore', String(this.captchaOcrNotBefore));
+      this.log(`🔄 ${reason}; перезагружаю страницу и беру новую капчу...`);
+      this.captchaReloadTimer = setTimeout(() => window.location.reload(), 1200);
     }
 
     async run() {
@@ -710,7 +725,7 @@
       } catch (error) {
         this.log(`⚠️ Автораспознавание не сработало: ${error.message}`);
         if (this.automationEnabled) {
-          this.restartAutomationCycle('капча не распознана');
+          this.reloadAfterCaptchaError('капча не распознана');
         } else {
           this.log('✏️ Можно ввести капчу вручную');
           captchaInputField.focus();

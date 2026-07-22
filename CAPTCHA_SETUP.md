@@ -3,8 +3,8 @@
 ## What is installed
 
 The relay uses a persistent local PaddleOCR worker with the
-`PP-OCRv5_mobile_rec` model. CapMonster fallback is disabled by default, so
-local recognition does not spend account balance.
+`PP-OCRv5_mobile_rec` model. Recognition is fully local and no external CAPTCHA
+service or API key is used.
 
 The isolated Python environment is stored in `.venv-paddle/`, and downloaded
 models are stored in `.paddlex/`. Nothing needs to be installed globally.
@@ -21,17 +21,12 @@ python -m venv .venv-paddle
 Optional `.env` settings:
 
 ```dotenv
-CAPMONSTER_RELAY_PORT=3210
-CAPMONSTER_AUTO_SUBMIT=false
+CAPTCHA_RELAY_PORT=3210
+CAPTCHA_AUTO_SUBMIT=false
 PADDLE_OCR_ENABLED=true
 PADDLE_OCR_MIN_CONFIDENCE=0
 PADDLE_OCR_VERBOSE=false
-CAPMONSTER_FALLBACK_ENABLED=false
 ```
-
-`CAPMONSTER_API` is not required while the fallback is disabled. Keep
-`CAPMONSTER_FALLBACK_ENABLED=false` during local testing to guarantee that no
-paid task is created.
 
 ## Start
 
@@ -49,7 +44,7 @@ connect to `127.0.0.1` if the browser asks.
 
 The userscript sends each four-character CAPTCHA to the local relay. PaddleOCR
 fills the input; verification mode leaves final submission to you unless
-`CAPMONSTER_AUTO_SUBMIT=true` is explicitly enabled.
+`CAPTCHA_AUTO_SUBMIT=true` is explicitly enabled.
 
 When the automatic cycle is started with `Ctrl+Shift+V`, a recognized CAPTCHA
 is submitted automatically even when the global auto-submit setting is off.
