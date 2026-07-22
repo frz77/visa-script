@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         e-konsulat Visa Automation
 // @namespace    http://tampermonkey.net/
-// @version      2.7
+// @version      2.8
 // @description  Быстрая автоматизация заполнения формы визы с импортом JSON пресета
 // @author       VisaBot
 // @match        *://secure.e-konsulat.gov.pl/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_notification
 // @connect      127.0.0.1
 // @run-at       document-end
 // ==/UserScript==
@@ -33,6 +34,7 @@
       this.captchaCandidateSince = 0;
       this.captchaOcrNotBefore = Number(sessionStorage.getItem('visaCaptchaOcrNotBefore') || 0);
       this.captchaReloadTimer = null;
+      this.audioContext = null;
       console.log('🔧 VisaAutomationUI constructor started');
 
       try {
@@ -317,6 +319,7 @@
       this.automationEnabled = true;
       this.stopWaiting = false;
       sessionStorage.setItem('visaAutomationEnabled', 'true');
+      this.armSuccessSound();
       this.log('🚀 Автоматический цикл запущен (Ctrl+Shift+X — остановить)');
       this.resumeAutomation();
     }
@@ -466,7 +469,15 @@
         }
 
         this.log('🎯 Свободный слот выбран, автоматические повторы остановлены');
+        this.playSuccessSound();
         this.showNotification('🎯 Свободный слот найден!', 'success');
+        if (typeof GM_notification === 'function') {
+          GM_notification({
+            title: 'Visa Bot — слот пойман',
+            text: 'Термин выбран и кнопка Dalej нажата. Продолжайте заполнение вручную.',
+            timeout: 0
+          });
+        }
         this.stopAutomation();
       } catch (error) {
         if (this.automationEnabled) {
@@ -935,8 +946,6 @@
         if (element.offsetParent === null) continue;
         const text = String(element.textContent || '').trim();
         if (this.isNoSlotsOrLoadError(text)) return text;
-        const isGenericError = element.matches('.mat-snack-bar-container, .alert, [class*="error"], [role="alert"]');
-        if (isGenericError && text && !/^(pole wymagane|required field)$/i.test(text)) return text;
       }
       return null;
     }
@@ -993,6 +1002,44 @@
 
     delay(ms) {
       return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    armSuccessSound() {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return;
+      try {
+        if (!this.audioContext) this.audioContext = new AudioContextClass();
+        if (this.audioContext.state === 'suspended') this.audioContext.resume().catch(() => {});
+      } catch {
+        this.audioContext = null;
+      }
+    }
+
+    playSuccessSound() {
+      this.armSuccessSound();
+      const context = this.audioContext;
+      if (!context) return;
+
+      const play = () => {
+        const startedAt = context.currentTime + 0.03;
+        [659.25, 783.99, 1046.5].forEach((frequency, index) => {
+          const oscillator = context.createOscillator();
+          const gain = context.createGain();
+          const noteStart = startedAt + index * 0.16;
+          oscillator.type = 'sine';
+          oscillator.frequency.value = frequency;
+          gain.gain.setValueAtTime(0.0001, noteStart);
+          gain.gain.exponentialRampToValueAtTime(0.18, noteStart + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.0001, noteStart + 0.24);
+          oscillator.connect(gain);
+          gain.connect(context.destination);
+          oscillator.start(noteStart);
+          oscillator.stop(noteStart + 0.25);
+        });
+      };
+
+      if (context.state === 'suspended') context.resume().then(play).catch(() => {});
+      else play();
     }
 
     showNotification(message, type = 'info') {
