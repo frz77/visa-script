@@ -9,7 +9,9 @@ from paddleocr import TextRecognition
 
 
 def emit(prefix, payload):
-    print(f"{prefix} {json.dumps(payload, ensure_ascii=False)}", flush=True)
+    # Keep the JSON-lines protocol independent of the Windows console code page.
+    # Paddle can occasionally return symbols such as £ that cp1251 cannot encode.
+    print(f"{prefix} {json.dumps(payload, ensure_ascii=True)}", flush=True)
 
 
 def preprocess(image_bytes):
