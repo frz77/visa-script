@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         e-konsulat Visa Automation
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  Быстрая автоматизация заполнения формы визы с импортом JSON пресета
 // @author       VisaBot
 // @match        *://secure.e-konsulat.gov.pl/*
@@ -29,6 +29,9 @@
       this.restartPending = false;
       this.restartSourceForm = null;
       this.lastAutoSubmittedCaptcha = null;
+      this.captchaCandidateSource = null;
+      this.captchaCandidateSince = 0;
+      this.captchaOcrNotBefore = Number(sessionStorage.getItem('visaCaptchaOcrNotBefore') || 0);
       console.log('🔧 VisaAutomationUI constructor started');
 
       try {
@@ -384,7 +387,9 @@
       if (!source || source === this.lastAutoSubmittedCaptcha) return;
       const form = captchaImage.closest('form') || captchaImage.closest('[role="form"]') || captchaImage.parentElement?.parentElement;
       const input = form && form.querySelector('input[type="text"]');
-      if (!input || String(input.value || '').trim().length !== 4) return;
+      const value = String(input && input.value || '').trim();
+      const sample = this.currentCaptchaSample;
+      if (!sample || sample.image !== source || sample.predicted !== value || value.length !== 4) return;
       this.lastAutoSubmittedCaptcha = source;
       this.submitCaptcha();
     }
@@ -401,6 +406,10 @@
       this.log(`🔄 ${reason}: возвращаюсь к началу цикла...`);
       this.retryTimer = setTimeout(() => {
         this.retryTimer = null;
+        this.captchaOcrNotBefore = Date.now() + 1500;
+        sessionStorage.setItem('visaCaptchaOcrNotBefore', String(this.captchaOcrNotBefore));
+        this.captchaCandidateSource = null;
+        this.captchaCandidateSince = 0;
         this.restartSourceForm = this.getServiceSelectionForm();
         this.restartPending = Boolean(this.restartSourceForm);
         if (!this.clickWizaKrajowa()) {
@@ -410,7 +419,7 @@
         } else if (!this.restartPending) {
           this.stopWaiting = false;
         }
-      }, 800);
+      }, 1800);
     }
 
     async run() {
@@ -579,6 +588,25 @@
       }
     }
 
+    isCaptchaStableForOcr(captchaImage) {
+      if (!this.isUsableCaptchaImage(captchaImage)) {
+        this.captchaCandidateSource = null;
+        this.captchaCandidateSince = 0;
+        return false;
+      }
+
+      const source = captchaImage.src;
+      if (source !== this.captchaCandidateSource) {
+        this.captchaCandidateSource = source;
+        this.captchaCandidateSince = Date.now();
+        return false;
+      }
+
+      if (Date.now() < this.captchaOcrNotBefore) return false;
+      sessionStorage.removeItem('visaCaptchaOcrNotBefore');
+      return Date.now() - this.captchaCandidateSince >= 750;
+    }
+
     watchForCaptcha() {
       setInterval(() => {
         const captchaImage = this.findCaptchaImage();
@@ -620,7 +648,7 @@
             loadingElement.style.display = 'none';
 
             if (captchaInputField &&
-                this.isUsableCaptchaImage(captchaImage) &&
+                this.isCaptchaStableForOcr(captchaImage) &&
                 captchaImage.src !== this.lastCaptchaSource &&
                 !this.captchaSolveInFlight) {
               this.lastCaptchaSource = captchaImage.src;
@@ -674,7 +702,7 @@
         if (this.automationEnabled || result.autoSubmit) {
           this.log('✅ Капча распознана, отправляю форму');
           this.lastAutoSubmittedCaptcha = source;
-          await this.delay(100);
+          await this.delay(250);
           await this.submitCaptcha();
         } else {
           this.log('🔎 Капча заполнена — проверьте ответ и нажмите Enter');
