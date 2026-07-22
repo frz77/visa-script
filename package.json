@@ -1,0 +1,7 @@
+{
+  "name": "visa-captcha-relay",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Local PaddleOCR CAPTCHA relay for the visa userscript",
+  "dependencies": {}
+}

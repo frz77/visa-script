@@ -1,0 +1,9 @@
+.env
+captcha-dataset/
+node_modules/
+.npm-cache/
+.venv-paddle/
+.paddlex/
+.claude/
+__pycache__/
+*.pyc
