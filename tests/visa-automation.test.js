@@ -15,12 +15,19 @@ function loadUserscript(relativePath) {
 
   const values = new Map();
   const timers = [];
+  const requests = [];
   const sandbox = {
     console,
     clearInterval() {},
-    clearTimeout() {},
+    clearTimeout(timer) {
+      if (timer) timer.cancelled = true;
+    },
+    GM_xmlhttpRequest(options) {
+      requests.push(options);
+    },
     document: {
       body: {},
+      querySelector() { return null; },
       querySelectorAll() { return []; },
     },
     sessionStorage: {
@@ -40,6 +47,7 @@ function loadUserscript(relativePath) {
   return {
     VisaAutomationUI: sandbox.VisaAutomationUI,
     document: sandbox.document,
+    requests,
     storage: values,
     timers,
   };
@@ -79,6 +87,71 @@ for (const userscriptPath of ['script.js']) {
       },
     }];
     assert.match(bot.findReservationError(), /Chwilowo wszystkie/);
+  });
+
+  test(`${userscriptPath}: service selection must be a visible usable form`, () => {
+    const { VisaAutomationUI, document } = loadUserscript(userscriptPath);
+    const bot = Object.create(VisaAutomationUI.prototype);
+    const label = text => ({ textContent: text, isConnected: true, offsetParent: {} });
+    const select = { isConnected: true, offsetParent: {}, getAttribute: () => 'false' };
+    const form = {
+      isConnected: true,
+      offsetParent: null,
+      querySelectorAll(selector) {
+        if (selector === 'mat-label') return [label('Rodzaj usługi'), label('Lokalizacja')];
+        if (selector === 'mat-select') return [select, select];
+        return [];
+      },
+    };
+    document.querySelectorAll = () => [form];
+
+    assert.equal(bot.getServiceSelectionForm(), null);
+    form.offsetParent = {};
+    assert.equal(bot.getServiceSelectionForm(), form);
+  });
+
+  test(`${userscriptPath}: CAPTCHA feedback waits for the real service form`, () => {
+    const { VisaAutomationUI, document, requests, storage, timers } = loadUserscript(userscriptPath);
+    const sample = {
+      image: 'data:image/png;base64,old',
+      predicted: 'aB12',
+      actual: 'aB12',
+      submittedAt: Date.now(),
+    };
+    let visibleCaptcha = null;
+    storage.set('visaPendingCaptchaFeedback', JSON.stringify(sample));
+    const bot = Object.assign(Object.create(VisaAutomationUI.prototype), {
+      findVisibleCaptchaImage: () => visibleCaptcha,
+      getServiceSelectionForm: () => null,
+      isElementVisible: element => Boolean(element?.visible),
+      log() {},
+      captchaSuccessCandidateKey: null,
+      captchaSuccessCandidateTimer: null,
+      reportedCaptchaSources: new Set(),
+    });
+    bot.confirmCaptchaFeedbackIfSuccessful();
+    assert.equal(requests.length, 0);
+    assert.equal(storage.has('visaPendingCaptchaFeedback'), true);
+
+    bot.getServiceSelectionForm = () => ({ visible: true });
+    bot.confirmCaptchaFeedbackIfSuccessful();
+    const transientTimer = timers.at(-1);
+    assert.equal(transientTimer.milliseconds, 800);
+
+    visibleCaptcha = { visible: true, src: 'data:image/png;base64,new' };
+    bot.confirmCaptchaFeedbackIfSuccessful();
+    assert.equal(transientTimer.cancelled, true);
+    assert.equal(storage.has('visaPendingCaptchaFeedback'), false);
+
+    storage.set('visaPendingCaptchaFeedback', JSON.stringify(sample));
+    visibleCaptcha = null;
+    bot.confirmCaptchaFeedbackIfSuccessful();
+    assert.equal(requests.length, 0);
+    assert.equal(timers.at(-1).milliseconds, 800);
+    timers.at(-1).callback();
+    assert.equal(requests.length, 1);
+    requests[0].onload({ status: 200 });
+    assert.equal(storage.has('visaPendingCaptchaFeedback'), false);
   });
 
   test(`${userscriptPath}: Ctrl+Shift+X latch blocks restart until a fresh start`, () => {

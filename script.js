@@ -24,6 +24,8 @@
       this.captchaSolveInFlight = false;
       this.currentCaptchaSample = null;
       this.reportedCaptchaSources = new Set();
+      this.captchaSuccessCandidateKey = null;
+      this.captchaSuccessCandidateTimer = null;
       this.automationEnabled = sessionStorage.getItem('visaAutomationEnabled') === 'true';
       this.manuallyStopped = sessionStorage.getItem('visaAutomationManuallyStopped') === 'true';
       this.automationWaitState = null;
@@ -393,16 +395,34 @@
         document.querySelector('img[alt*="Weryfikacja"]');
     }
 
+    isElementVisible(element) {
+      return Boolean(element && element.isConnected !== false && element.offsetParent !== null);
+    }
+
+    findVisibleCaptchaImage() {
+      return [...document.querySelectorAll(
+        'img[alt="Weryfikacja obrazkowa"], img[alt*="Weryfikacja"]'
+      )].find(image => this.isElementVisible(image)) || null;
+    }
+
     getServiceSelectionForm() {
-      const labels = [...document.querySelectorAll('mat-label')]
-        .map(label => String(label.textContent || '').trim().toLowerCase());
-      if (!labels.some(label => label.includes('rodzaj usługi')) ||
-          !labels.some(label => label.includes('lokalizacja'))) {
-        return null;
+      const forms = document.querySelectorAll(
+        'app-visa-reservation-appointment-form form, form'
+      );
+      for (const form of forms) {
+        if (!this.isElementVisible(form)) continue;
+        const labels = [...form.querySelectorAll('mat-label')]
+          .filter(label => this.isElementVisible(label))
+          .map(label => String(label.textContent || '').trim().toLowerCase());
+        const visibleSelects = [...form.querySelectorAll('mat-select')]
+          .filter(select => this.isElementVisible(select) && select.getAttribute('aria-disabled') !== 'true');
+        if (labels.some(label => label.includes('rodzaj usługi')) &&
+            labels.some(label => label.includes('lokalizacja')) &&
+            visibleSelects.length >= 2) {
+          return form;
+        }
       }
-      return document.querySelector('app-visa-reservation-appointment-form form') ||
-        document.querySelector('mat-select')?.closest('form') ||
-        document.body;
+      return null;
     }
 
     submitFilledCaptchaForAutomation(captchaImage) {
@@ -858,29 +878,63 @@
       setTimeout(check, 0);
     }
 
+    resetCaptchaSuccessCandidate() {
+      this.captchaSuccessCandidateKey = null;
+      if (this.captchaSuccessCandidateTimer) {
+        clearTimeout(this.captchaSuccessCandidateTimer);
+        this.captchaSuccessCandidateTimer = null;
+      }
+    }
+
     confirmCaptchaFeedbackIfSuccessful() {
       const raw = sessionStorage.getItem('visaPendingCaptchaFeedback');
-      if (!raw) return;
+      if (!raw) {
+        this.resetCaptchaSuccessCandidate();
+        return;
+      }
 
       let sample;
       try {
         sample = JSON.parse(raw);
       } catch {
         sessionStorage.removeItem('visaPendingCaptchaFeedback');
+        this.resetCaptchaSuccessCandidate();
         return;
       }
       if (!sample.submittedAt || Date.now() - sample.submittedAt > 10 * 60 * 1000) {
         sessionStorage.removeItem('visaPendingCaptchaFeedback');
+        this.resetCaptchaSuccessCandidate();
         return;
       }
 
-      const labels = [...document.querySelectorAll('mat-label')]
-        .map(label => String(label.textContent || '').trim().toLowerCase());
-      const isServiceSelectionPage =
-        !document.querySelector('img[alt="Weryfikacja obrazkowa"], img[alt*="Weryfikacja"]') &&
-        labels.some(label => label.includes('rodzaj usługi')) &&
-        labels.some(label => label.includes('lokalizacja'));
-      if (!isServiceSelectionPage || this.reportedCaptchaSources.has(sample.image)) return;
+      const captchaImage = this.findVisibleCaptchaImage();
+      if (this.isElementVisible(captchaImage)) {
+        this.resetCaptchaSuccessCandidate();
+        if (captchaImage.src && captchaImage.src !== sample.image) {
+          sessionStorage.removeItem('visaPendingCaptchaFeedback');
+          this.reportedCaptchaSources.delete(sample.image);
+          this.log('📚 Капча отклонена сайтом — пример не сохранён');
+        }
+        return;
+      }
+
+      const serviceForm = this.getServiceSelectionForm();
+      if (!serviceForm) {
+        this.resetCaptchaSuccessCandidate();
+        return;
+      }
+      if (this.reportedCaptchaSources.has(sample.image)) return;
+
+      const candidateKey = `${sample.image}:${sample.submittedAt}`;
+      if (this.captchaSuccessCandidateKey !== candidateKey) {
+        this.resetCaptchaSuccessCandidate();
+        this.captchaSuccessCandidateKey = candidateKey;
+        this.captchaSuccessCandidateTimer = setTimeout(() => {
+          this.captchaSuccessCandidateTimer = null;
+          this.confirmCaptchaFeedbackIfSuccessful();
+        }, 800);
+        return;
+      }
 
       this.reportedCaptchaSources.add(sample.image);
       GM_xmlhttpRequest({
@@ -900,6 +954,7 @@
         onload: (response) => {
           if (response.status >= 200 && response.status < 300) {
             sessionStorage.removeItem('visaPendingCaptchaFeedback');
+            this.resetCaptchaSuccessCandidate();
             this.log('📚 Сайт принял капчу — успешный пример сохранён');
           } else {
             this.reportedCaptchaSources.delete(sample.image);
