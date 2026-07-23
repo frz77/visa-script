@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         e-konsulat Visa Automation
 // @namespace    http://tampermonkey.net/
-// @version      2.8
+// @version      2.9
 // @description  Быстрая автоматизация заполнения формы визы с импортом JSON пресета
 // @author       VisaBot
 // @match        *://secure.e-konsulat.gov.pl/*
@@ -25,8 +25,10 @@
       this.currentCaptchaSample = null;
       this.reportedCaptchaSources = new Set();
       this.automationEnabled = sessionStorage.getItem('visaAutomationEnabled') === 'true';
+      this.manuallyStopped = sessionStorage.getItem('visaAutomationManuallyStopped') === 'true';
       this.automationWaitState = null;
       this.retryTimer = null;
+      this.restartWatchdogTimer = null;
       this.restartPending = false;
       this.restartSourceForm = null;
       this.lastAutoSubmittedCaptcha = null;
@@ -241,10 +243,10 @@
           this.restartAutomationCycle('ручной перезапуск');
         }
 
-        // Ctrl+Shift+X — остановить автоматические повторы
+        // Ctrl+Shift+X — полностью остановить автоматизацию до нового Ctrl+Shift+V
         if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'x') {
           e.preventDefault();
-          this.stopAutomation('Автоматизация остановлена');
+          this.stopAutomation('Автоматизация полностью остановлена. Для нового запуска нажмите Ctrl+Shift+V', true);
         }
 
         // Ctrl+Shift+Enter для отправки капчи
@@ -316,20 +318,25 @@
         this.log('❌ Сначала загрузите пресет');
         return;
       }
+      this.manuallyStopped = false;
       this.automationEnabled = true;
       this.stopWaiting = false;
+      sessionStorage.removeItem('visaAutomationManuallyStopped');
       sessionStorage.setItem('visaAutomationEnabled', 'true');
       this.armSuccessSound();
       this.log('🚀 Автоматический цикл запущен (Ctrl+Shift+X — остановить)');
       this.resumeAutomation();
     }
 
-    stopAutomation(message) {
+    stopAutomation(message, manual = false) {
+      this.manuallyStopped = manual;
       this.automationEnabled = false;
       this.stopWaiting = true;
       this.restartPending = false;
       this.restartSourceForm = null;
       sessionStorage.removeItem('visaAutomationEnabled');
+      if (manual) sessionStorage.setItem('visaAutomationManuallyStopped', 'true');
+      else sessionStorage.removeItem('visaAutomationManuallyStopped');
       if (this.retryTimer) {
         clearTimeout(this.retryTimer);
         this.retryTimer = null;
@@ -338,16 +345,20 @@
         clearTimeout(this.captchaReloadTimer);
         this.captchaReloadTimer = null;
       }
+      if (this.restartWatchdogTimer) {
+        clearTimeout(this.restartWatchdogTimer);
+        this.restartWatchdogTimer = null;
+      }
       if (message) this.log(`⏹️ ${message}`);
     }
 
     watchForAutomationPage() {
-      setInterval(() => this.resumeAutomation(), 500);
+      setInterval(() => this.resumeAutomation(), 350);
       setTimeout(() => this.resumeAutomation(), 0);
     }
 
     resumeAutomation() {
-      if (!this.automationEnabled || !this.preset || this.isRunning || this.retryTimer) return;
+      if (!this.isAutomationActive() || !this.preset || this.isRunning || this.retryTimer) return;
 
       const captchaImage = this.findCaptchaImage();
       if (captchaImage && captchaImage.offsetParent !== null) {
@@ -362,6 +373,10 @@
           this.restartPending = false;
           this.restartSourceForm = null;
           this.stopWaiting = false;
+          if (this.restartWatchdogTimer) {
+            clearTimeout(this.restartWatchdogTimer);
+            this.restartWatchdogTimer = null;
+          }
         } else {
           return;
         }
@@ -407,14 +422,21 @@
         this.log('❌ Сначала загрузите пресет');
         return;
       }
-      this.automationEnabled = true;
-      sessionStorage.setItem('visaAutomationEnabled', 'true');
+      if (!this.isAutomationActive()) {
+        this.log('⏹️ Автоматизация остановлена. Ctrl+Shift+Z игнорируется; для запуска нажмите Ctrl+Shift+V');
+        return;
+      }
       this.stopWaiting = true;
       if (this.retryTimer) clearTimeout(this.retryTimer);
+      if (this.restartWatchdogTimer) {
+        clearTimeout(this.restartWatchdogTimer);
+        this.restartWatchdogTimer = null;
+      }
       this.log(`🔄 ${reason}: возвращаюсь к началу цикла...`);
       this.retryTimer = setTimeout(() => {
         this.retryTimer = null;
-        this.captchaOcrNotBefore = Date.now() + 1500;
+        if (!this.isAutomationActive()) return;
+        this.captchaOcrNotBefore = Date.now() + 1000;
         sessionStorage.setItem('visaCaptchaOcrNotBefore', String(this.captchaOcrNotBefore));
         this.captchaCandidateSource = null;
         this.captchaCandidateSince = 0;
@@ -423,21 +445,38 @@
         if (!this.clickWizaKrajowa()) {
           this.restartPending = false;
           this.stopWaiting = false;
-          this.log('⚠️ Не удалось найти ссылку Wiza krajowa; нажмите Ctrl+Shift+Z ещё раз');
+          this.log('⚠️ Не удалось найти ссылку Wiza krajowa; повторяю автоматически');
+          this.restartAutomationCycle('ссылка Wiza krajowa ещё не готова');
         } else if (!this.restartPending) {
           this.stopWaiting = false;
+        } else {
+          this.restartWatchdogTimer = setTimeout(() => {
+            this.restartWatchdogTimer = null;
+            if (!this.isAutomationActive()) return;
+            if (this.restartPending && this.getServiceSelectionForm() === this.restartSourceForm) {
+              this.restartPending = false;
+              this.restartSourceForm = null;
+              this.stopWaiting = false;
+              this.restartAutomationCycle('переход к новому циклу не завершился');
+            }
+          }, 3500);
         }
-      }, 1800);
+      }, 1100);
     }
 
     reloadAfterCaptchaError(reason) {
-      if (this.captchaReloadTimer) return;
-      this.automationEnabled = true;
-      sessionStorage.setItem('visaAutomationEnabled', 'true');
-      this.captchaOcrNotBefore = Date.now() + 3500;
+      if (this.captchaReloadTimer || !this.isAutomationActive()) return;
+      this.captchaOcrNotBefore = Date.now() + 2500;
       sessionStorage.setItem('visaCaptchaOcrNotBefore', String(this.captchaOcrNotBefore));
       this.log(`🔄 ${reason}; перезагружаю страницу и беру новую капчу...`);
-      this.captchaReloadTimer = setTimeout(() => window.location.reload(), 1200);
+      this.captchaReloadTimer = setTimeout(() => {
+        this.captchaReloadTimer = null;
+        if (this.isAutomationActive()) window.location.reload();
+      }, 900);
+    }
+
+    isAutomationActive() {
+      return this.automationEnabled && !this.manuallyStopped;
     }
 
     async run() {
@@ -480,7 +519,7 @@
         }
         this.stopAutomation();
       } catch (error) {
-        if (this.automationEnabled) {
+        if (this.isAutomationActive()) {
           this.restartAutomationCycle(error.message);
         } else {
           this.log('❌ Ошибка: ' + error.message);
@@ -509,18 +548,19 @@
       matSelect.click();
       let options = [];
       while (options.length === 0) {
-        if (this.stopWaiting) return false;
+        if (this.stopWaiting || !this.isAutomationActive()) return false;
         const loadError = this.findReservationError();
         if (loadError) throw new Error(`форма не загрузилась: ${loadError}`);
         options = [...document.querySelectorAll('mat-option[role="option"]')];
-        if (options.length === 0) await this.delay(100);
+        if (options.length === 0) await this.delay(80);
       }
 
       for (const option of options) {
+        if (!this.isAutomationActive()) return false;
         const optionText = option.textContent.trim();
         if (optionText.toLowerCase().includes(searchValue.toLowerCase())) {
           option.click();
-          await this.delay(150);
+          await this.delay(110);
           return true;
         }
       }
@@ -542,7 +582,7 @@
       }
 
       terminSelect.click();
-      await this.delay(300);
+      await this.delay(200);
 
       const options = this.getAvailableDateOptions();
 
@@ -563,7 +603,7 @@
             const optionText = option.textContent.trim();
             if (optionText.includes(dateToFind)) {
               option.click();
-              await this.delay(150);
+              await this.delay(110);
               this.log(`📅 Выбрана дата: ${optionText}`);
               return await this.clickDalejButton();
             }
@@ -580,7 +620,7 @@
       if (options.length > 0) {
         const firstOption = options[0];
         firstOption.click();
-        await this.delay(150);
+        await this.delay(110);
         this.log(`📅 Выбрана первая доступная: ${firstOption.textContent.trim()}`);
         return await this.clickDalejButton();
       }
@@ -589,13 +629,14 @@
     }
 
     async clickDalejButton() {
-      await this.delay(300);
+      await this.delay(220);
+      if (!this.isAutomationActive()) return false;
       const buttons = document.querySelectorAll('button[mat-button]');
       for (const btn of buttons) {
         if (btn.textContent.includes('Dalej')) {
           this.log('✓ Нажимаю "Dalej"...');
           btn.click();
-          await this.delay(500);
+          await this.delay(400);
           return true;
         }
       }
@@ -674,6 +715,7 @@
             loadingElement.style.display = 'none';
 
             if (captchaInputField &&
+                !this.manuallyStopped &&
                 this.isCaptchaStableForOcr(captchaImage) &&
                 captchaImage.src !== this.lastCaptchaSource &&
                 !this.captchaSolveInFlight) {
@@ -707,6 +749,10 @@
         this.currentCaptchaSample = { image: source, predicted: '', taskId: null };
         const result = await this.requestCaptchaSolution(source);
 
+        if (this.manuallyStopped) {
+          this.log('⏹️ Ответ OCR отброшен: автоматизация остановлена');
+          return;
+        }
         if (!captchaImage.isConnected || captchaImage.src !== source || captchaImage.offsetParent === null) {
           this.log('ℹ️ Капча уже изменилась, старый ответ пропущен');
           return;
@@ -725,7 +771,7 @@
         captchaInputField.dispatchEvent(new Event('change', { bubbles: true }));
         captchaInputField.focus();
 
-        if (this.automationEnabled || result.autoSubmit) {
+        if (this.isAutomationActive() || (result.autoSubmit && !this.manuallyStopped)) {
           this.log('✅ Капча распознана, отправляю форму');
           this.lastAutoSubmittedCaptcha = source;
           await this.delay(250);
@@ -735,7 +781,7 @@
         }
       } catch (error) {
         this.log(`⚠️ Автораспознавание не сработало: ${error.message}`);
-        if (this.automationEnabled) {
+        if (this.isAutomationActive()) {
           this.reloadAfterCaptchaError('капча не распознана');
         } else {
           this.log('✏️ Можно ввести капчу вручную');
@@ -865,9 +911,14 @@
     }
 
     async submitCaptcha() {
+      if (this.manuallyStopped) {
+        this.log('⏹️ Отправка отменена: автоматизация остановлена');
+        return;
+      }
       this.stageCaptchaFeedback();
       this.log('✓ Отправляю капчу...');
       await this.delay(200);
+      if (this.manuallyStopped) return;
 
       // Нажимаем Dalej
       const buttons = document.querySelectorAll('button[mat-button]');
@@ -928,14 +979,34 @@
     }
 
     isNoSlotsOrLoadError(text) {
-      const value = String(text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const value = String(text || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[łŁ]/g, 'l')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
       return /brak[^.]{0,50}(?:termin|dat|wolnych miejsc)/.test(value) ||
         /nie (?:ma|znaleziono)[^.]{0,80}(?:termin|dat|wolnych miejsc)/.test(value) ||
-        /nie udało się/.test(value) ||
-        /wystąpił błąd/.test(value) ||
-        /spróbuj ponownie/.test(value) ||
+        this.isFullyBookedMessage(value) ||
+        /nie udalo sie/.test(value) ||
+        /wystapil blad/.test(value) ||
+        /sprobuj ponownie/.test(value) ||
         /no (?:free|available) (?:dates|appointments|slots)/.test(value) ||
         /an error occurred/.test(value);
+    }
+
+    isFullyBookedMessage(text) {
+      const value = String(text || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[łŁ]/g, 'l')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+      return /chwilowo wszystkie udostepnione terminy zostaly zarezerwowane/.test(value) ||
+        /wszystkie[^.]{0,80}terminy[^.]{0,80}zarezerwowane/.test(value) ||
+        /prosimy sprobowac[^.]{0,80}terminie pozniejszym/.test(value);
     }
 
     findReservationError() {
@@ -946,6 +1017,19 @@
         if (element.offsetParent === null) continue;
         const text = String(element.textContent || '').trim();
         if (this.isNoSlotsOrLoadError(text)) return text;
+      }
+      const visibleText = [];
+      const walker = document.createTreeWalker(document.body, 4);
+      let node;
+      while ((node = walker.nextNode())) {
+        const parent = node.parentElement;
+        if (!parent || parent.closest('#visa-automation-panel') || parent.offsetParent === null) continue;
+        const text = String(node.nodeValue || '').trim();
+        if (text) visibleText.push(text);
+      }
+      const pageText = visibleText.join(' ');
+      if (this.isFullyBookedMessage(pageText)) {
+        return 'Chwilowo wszystkie udostępnione terminy zostały zarezerwowane';
       }
       return null;
     }
@@ -970,8 +1054,7 @@
 
       while (true) {
         // Проверяем флаг прерывания
-        if (this.stopWaiting) {
-          this.stopWaiting = false;
+        if (this.stopWaiting || !this.isAutomationActive()) {
           this.log('⏹️  Ожидание прервано');
           return false;
         }
@@ -996,7 +1079,7 @@
         if (attempts % 120 === 0) {
           this.log('⏳ Страница ещё загружается; жду слоты или сообщение об ошибке...');
         }
-        await this.delay(250);
+        await this.delay(180);
       }
     }
 

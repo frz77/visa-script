@@ -3,5 +3,9 @@
   "private": true,
   "version": "1.0.0",
   "description": "Local PaddleOCR CAPTCHA relay for the visa userscript",
+  "scripts": {
+    "start": "node captcha-relay.js",
+    "test": "node --check script.js && node --check captcha-relay.js && node --test tests/visa-automation.test.js"
+  },
   "dependencies": {}
 }
