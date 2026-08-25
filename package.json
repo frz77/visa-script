@@ -5,7 +5,7 @@
   "description": "Local PaddleOCR CAPTCHA relay for the visa userscript",
   "scripts": {
     "start": "node captcha-relay.js",
-    "test": "node --check script.js && node --check captcha-relay.js && node --test tests/visa-automation.test.js"
+    "test": "node --check script.js && node --check captcha-relay.js && node --test tests/visa-automation.test.js tests/captcha-relay.test.js"
   },
   "dependencies": {}
 }

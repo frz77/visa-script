@@ -12,15 +12,18 @@ DATASET = ROOT / "captcha-dataset"
 
 
 def load_samples():
-    samples = []
+    samples = {}
     for line in (DATASET / "answers.jsonl").read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        row = json.loads(line)
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
         image_path = DATASET / row.get("image", "")
-        if row.get("actual") and image_path.is_file():
-            samples.append((image_path, row["actual"]))
-    return samples
+        if row.get("hash") and row.get("actual") and image_path.is_file():
+            samples.setdefault(row["hash"], (image_path, row["actual"]))
+    return list(samples.values())
 
 
 def variants(image):

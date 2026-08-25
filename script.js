@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         e-konsulat Visa Automation
 // @namespace    http://tampermonkey.net/
-// @version      2.9
+// @version      3.7
 // @description  Быстрая автоматизация заполнения формы визы с импортом JSON пресета
 // @author       VisaBot
 // @match        *://secure.e-konsulat.gov.pl/*
@@ -29,15 +29,25 @@
       this.automationEnabled = sessionStorage.getItem('visaAutomationEnabled') === 'true';
       this.manuallyStopped = sessionStorage.getItem('visaAutomationManuallyStopped') === 'true';
       this.automationWaitState = null;
-      this.retryTimer = null;
+      this.domWaiters = new Set();
+      this.restartAttemptInFlight = false;
+      this.retryDelayTimer = null;
+      this.attemptStartedAt = 0;
+      this.retryMode = sessionStorage.getItem('visaRetryMode') === 'interval' ? 'interval' : 'fast';
+      this.retryIntervalSeconds = this.normalizeRetryInterval(
+        sessionStorage.getItem('visaRetryIntervalSeconds') || 60
+      );
+      this.logSessionId = this.getOrCreateLogSessionId();
+      this.logRelayRetryAfter = 0;
       this.restartWatchdogTimer = null;
       this.restartPending = false;
+      this.restartConfirmationPending = false;
       this.restartSourceForm = null;
       this.lastAutoSubmittedCaptcha = null;
       this.captchaCandidateSource = null;
       this.captchaCandidateSince = 0;
-      this.captchaOcrNotBefore = Number(sessionStorage.getItem('visaCaptchaOcrNotBefore') || 0);
-      this.captchaReloadTimer = null;
+      this.captchaStabilityTimer = null;
+      this.captchaReloadPending = false;
       this.audioContext = null;
       console.log('🔧 VisaAutomationUI constructor started');
 
@@ -53,28 +63,30 @@
     createUI() {
       console.log('📝 Creating UI...');
 
-      // Основной контейнер - ПО ЦЕНТРУ И БОЛЬШОЙ
+      // Компактная панель в правом нижнем углу
       const container = document.createElement('div');
       container.id = 'visa-automation-panel';
       container.style.cssText = `
         position: fixed !important;
-        top: 50% !important;
-        left: 50% !important;
-        transform: translate(-50%, -50%) !important;
-        width: 420px !important;
-        max-height: 90vh !important;
+        top: auto !important;
+        right: 20px !important;
+        bottom: 20px !important;
+        left: auto !important;
+        transform: none !important;
+        width: 340px !important;
+        max-height: 72vh !important;
         background: white !important;
         border-radius: 8px !important;
         box-shadow: 0 4px 16px rgba(0,0,0,0.2) !important;
         z-index: 999998 !important;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
-        overflow: visible !important;
+        overflow: hidden !important;
         display: flex !important;
         flex-direction: column !important;
       `;
 
       const headerHTML = `
-        <div style="background: #667eea; color: white; padding: 15px; font-weight: 600; font-size: 15px; display: flex; justify-content: space-between; align-items: center;">
+        <div style="background: #667eea; color: white; padding: 10px 12px; font-weight: 600; font-size: 14px; display: flex; justify-content: space-between; align-items: center;">
           <span>🇵🇱 Visa Bot</span>
           <button id="visa-minimize-btn" style="background: none; border: none; color: white; cursor: pointer; font-size: 18px;">−</button>
         </div>
@@ -84,7 +96,7 @@
             <div id="visa-progress-text" style="font-size: 11px; color: #0d47a1; margin-top: 4px;"></div>
           </div>
 
-        <div id="visa-content" style="padding: 15px; overflow-y: auto; max-height: 500px; font-size: 13px;">
+        <div id="visa-content" style="padding: 10px; overflow-y: auto; max-height: calc(72vh - 42px); font-size: 12px;">
           <div id="visa-captcha-panel" style="display: none; margin-bottom: 15px; padding: 12px; background: #fff3e0; border-radius: 6px; border: 1px solid #ffb74d;">
             <div style="margin-bottom: 10px; text-align: center; background: white; padding: 8px; border-radius: 4px;">
               <img id="visa-captcha-image" src="" alt="Captcha" style="max-width: 100%; max-height: 90px; display: none;">
@@ -102,17 +114,32 @@
             <div id="visa-preset-details"></div>
           </div>
 
+          <div style="display: grid; grid-template-columns: 1fr 95px; gap: 8px; margin-bottom: 10px;">
+            <label style="font-size: 11px; font-weight: 600;">
+              Режим повторов
+              <select id="visa-retry-mode" style="width: 100%; margin-top: 5px; padding: 7px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box;">
+                <option value="fast">Быстро</option>
+                <option value="interval">Каждые X сек.</option>
+              </select>
+            </label>
+            <label style="font-size: 11px; font-weight: 600;">
+              X секунд
+              <input id="visa-retry-interval" type="number" min="1" step="1" style="width: 100%; margin-top: 5px; padding: 7px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box;">
+            </label>
+          </div>
+
           <div style="display: flex; gap: 8px; margin-bottom: 10px;">
             <button id="visa-run-btn" style="flex: 1; padding: 10px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 12px;">▶️ ЗАПУСК</button>
             <button id="visa-clear-btn" style="flex: 1; padding: 10px; background: #f44336; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 12px;">✕ ОЧИСТИТЬ</button>
           </div>
 
-          <div id="visa-log" style="font-size: 10px; color: #666; max-height: 120px; overflow-y: auto; padding: 8px; background: #fafafa; border-radius: 4px; border: 1px solid #e0e0e0;"></div>
+          <div id="visa-log" style="font-size: 10px; color: #666; max-height: 80px; overflow-y: auto; padding: 6px; background: #fafafa; border-radius: 4px; border: 1px solid #e0e0e0;"></div>
         </div>
       `;
 
       container.innerHTML = headerHTML;
       document.body.appendChild(container);
+      this.syncRetryControls();
 
       console.log('✅ UI container added to DOM');
       console.log('Container element:', document.getElementById('visa-automation-panel'));
@@ -136,9 +163,9 @@
             this.preset = JSON.parse(event.target.result);
             this.savePresetToStorage();
             this.showPresetStatus();
-            this.log('✅ Пресет загружен');
+            this.log('preset.loaded');
           } catch (error) {
-            this.log('❌ Ошибка при парсинге JSON: ' + error.message);
+            this.log(`preset.invalid error="${error.message}"`);
           }
         };
         reader.readAsText(file);
@@ -147,7 +174,7 @@
       // Запуск
       document.getElementById('visa-run-btn').addEventListener('click', () => {
         if (!this.preset) {
-          this.log('❌ Сначала загрузите пресет');
+          this.log('preset.required');
           return;
         }
         this.startAutomation();
@@ -159,8 +186,8 @@
         document.getElementById('visa-file-input').value = '';
         document.getElementById('visa-preset-status').style.display = 'none';
         sessionStorage.removeItem('visaBotPreset');
-        this.stopAutomation('Автоматизация остановлена: пресет очищен');
-        this.log('🗑️  Пресет очищен');
+        this.stopAutomation('preset_cleared');
+        this.log('preset.cleared');
       });
 
       // Минимизация
@@ -201,6 +228,22 @@
         this.focusCaptchaInput();
       });
 
+      document.getElementById('visa-retry-mode').addEventListener('change', (e) => {
+        this.retryMode = e.target.value === 'interval' ? 'interval' : 'fast';
+        this.saveRetrySettings();
+        this.syncRetryControls();
+        this.log(this.retryMode === 'interval'
+          ? `retry.mode mode=interval seconds=${this.retryIntervalSeconds}`
+          : 'retry.mode mode=fast');
+      });
+
+      document.getElementById('visa-retry-interval').addEventListener('change', (e) => {
+        this.retryIntervalSeconds = this.normalizeRetryInterval(e.target.value);
+        this.saveRetrySettings();
+        this.syncRetryControls();
+        this.log(`retry.interval seconds=${this.retryIntervalSeconds}`);
+      });
+
       // Капча - Enter отправляет
       document.addEventListener('keypress', (e) => {
         if (e.key === 'Enter' && document.getElementById('visa-captcha-panel').style.display !== 'none') {
@@ -213,7 +256,7 @@
               if (captchaInput && document.activeElement === captchaInput) {
                 e.preventDefault();
                 // Нажимаем Dalej при Enter
-                setTimeout(() => this.submitCaptcha(), 100);
+                this.submitCaptcha();
               }
             }
           }
@@ -235,20 +278,20 @@
           if (this.preset) {
             this.startAutomation();
           } else {
-            this.log('❌ Загрузите пресет (Ctrl+Shift+V)');
+            this.log('preset.required');
           }
         }
 
         // Ctrl+Shift+Z — немедленно начать новый цикл
         if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'z') {
           e.preventDefault();
-          this.restartAutomationCycle('ручной перезапуск');
+          this.restartAutomationCycle('manual');
         }
 
         // Ctrl+Shift+X — полностью остановить автоматизацию до нового Ctrl+Shift+V
         if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'x') {
           e.preventDefault();
-          this.stopAutomation('Автоматизация полностью остановлена. Для нового запуска нажмите Ctrl+Shift+V', true);
+          this.stopAutomation('manual', true);
         }
 
         // Ctrl+Shift+Enter для отправки капчи
@@ -257,6 +300,34 @@
           this.submitCaptcha();
         }
       });
+    }
+
+    normalizeRetryInterval(value) {
+      const seconds = Math.floor(Number(value));
+      return Number.isFinite(seconds) && seconds >= 1 ? seconds : 60;
+    }
+
+    saveRetrySettings() {
+      sessionStorage.setItem('visaRetryMode', this.retryMode);
+      sessionStorage.setItem('visaRetryIntervalSeconds', String(this.retryIntervalSeconds));
+    }
+
+    syncRetryControls() {
+      const modeSelect = document.getElementById('visa-retry-mode');
+      const intervalInput = document.getElementById('visa-retry-interval');
+      if (modeSelect) modeSelect.value = this.retryMode;
+      if (intervalInput) {
+        intervalInput.value = String(this.retryIntervalSeconds);
+        intervalInput.disabled = this.retryMode !== 'interval';
+      }
+    }
+
+    isIntervalRetryMode() {
+      return this.retryMode === 'interval';
+    }
+
+    getAutomationWaitTimeout() {
+      return this.isIntervalRetryMode() ? 0 : 5000;
     }
 
     showPresetStatus() {
@@ -277,14 +348,14 @@
     savePresentToStorage() {
       if (this.preset) {
         sessionStorage.setItem('visaBotPreset', JSON.stringify(this.preset));
-        this.log('💾 Пресет сохранён в памяти вкладки');
+        this.log('preset.saved');
       }
     }
 
     savePresetToStorage() {
       if (this.preset) {
         sessionStorage.setItem('visaBotPreset', JSON.stringify(this.preset));
-        this.log('💾 Пресет сохранён в памяти вкладки');
+        this.log('preset.saved');
       }
     }
 
@@ -293,14 +364,12 @@
         const saved = sessionStorage.getItem('visaBotPreset');
         if (saved) {
           this.preset = JSON.parse(saved);
-          setTimeout(() => {
-            this.showPresetStatus();
-            this.log('✅ Пресет восстановлен из памяти вкладки');
-          }, 100);
+          this.showPresetStatus();
+          this.log('preset.restored');
           return true;
         }
       } catch (e) {
-        this.log('❌ Ошибка при восстановлении пресета');
+        this.log('preset.restore_failed');
         sessionStorage.removeItem('visaBotPreset');
       }
       return false;
@@ -308,25 +377,83 @@
 
     log(message) {
       const logDiv = document.getElementById('visa-log');
-      const timestamp = new Date().toLocaleTimeString('ru-RU');
+      const now = new Date();
+      const timestamp = now.toLocaleTimeString('ru-RU');
       const entry = document.createElement('div');
       entry.textContent = `[${timestamp}] ${message}`;
       logDiv.appendChild(entry);
       logDiv.scrollTop = logDiv.scrollHeight;
+      this.persistLogEntry(now, timestamp, message);
+    }
+
+    getOrCreateLogSessionId() {
+      const formatVersion = 'compact-v1';
+      const saved = sessionStorage.getItem('visaLogSessionId');
+      if (saved && sessionStorage.getItem('visaLogFormatVersion') === formatVersion) return saved;
+      const now = new Date();
+      const pad = value => String(value).padStart(2, '0');
+      const sessionId = [
+        now.getFullYear(),
+        pad(now.getMonth() + 1),
+        pad(now.getDate()),
+      ].join('-') + '_' + [
+        pad(now.getHours()),
+        pad(now.getMinutes()),
+        pad(now.getSeconds()),
+      ].join('-') + '_' + Math.random().toString(36).slice(2, 8);
+      sessionStorage.setItem('visaLogSessionId', sessionId);
+      sessionStorage.setItem('visaLogFormatVersion', formatVersion);
+      return sessionId;
+    }
+
+    persistLogEntry(now, displayTime, message) {
+      if (Date.now() < this.logRelayRetryAfter) return;
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: 'http://127.0.0.1:3210/log',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Visa-Captcha-Relay': '1'
+        },
+        data: JSON.stringify({
+          sessionId: this.logSessionId,
+          timestamp: now.toISOString(),
+          displayTime,
+          message: String(message || '')
+        }),
+        timeout: 2000,
+        onload: response => {
+          if (response.status < 200 || response.status >= 300) {
+            this.logRelayRetryAfter = Date.now() + 5000;
+          }
+        },
+        onerror: () => {
+          this.logRelayRetryAfter = Date.now() + 5000;
+        },
+        ontimeout: () => {
+          this.logRelayRetryAfter = Date.now() + 5000;
+        }
+      });
     }
 
     startAutomation() {
       if (!this.preset) {
-        this.log('❌ Сначала загрузите пресет');
+        this.log('preset.required');
         return;
       }
       this.manuallyStopped = false;
       this.automationEnabled = true;
       this.stopWaiting = false;
+      if (this.retryDelayTimer) {
+        clearTimeout(this.retryDelayTimer);
+        this.retryDelayTimer = null;
+      }
       sessionStorage.removeItem('visaAutomationManuallyStopped');
       sessionStorage.setItem('visaAutomationEnabled', 'true');
       this.armSuccessSound();
-      this.log('🚀 Автоматический цикл запущен (Ctrl+Shift+X — остановить)');
+      this.log(this.isIntervalRetryMode()
+        ? `automation.start mode=interval seconds=${this.retryIntervalSeconds}`
+        : 'automation.start mode=fast');
       this.resumeAutomation();
     }
 
@@ -335,35 +462,47 @@
       this.automationEnabled = false;
       this.stopWaiting = true;
       this.restartPending = false;
+      this.restartConfirmationPending = false;
       this.restartSourceForm = null;
       sessionStorage.removeItem('visaAutomationEnabled');
       if (manual) sessionStorage.setItem('visaAutomationManuallyStopped', 'true');
       else sessionStorage.removeItem('visaAutomationManuallyStopped');
-      if (this.retryTimer) {
-        clearTimeout(this.retryTimer);
-        this.retryTimer = null;
+      this.restartAttemptInFlight = false;
+      this.captchaReloadPending = false;
+      if (this.retryDelayTimer) {
+        clearTimeout(this.retryDelayTimer);
+        this.retryDelayTimer = null;
       }
-      if (this.captchaReloadTimer) {
-        clearTimeout(this.captchaReloadTimer);
-        this.captchaReloadTimer = null;
+      if (this.captchaStabilityTimer) {
+        clearTimeout(this.captchaStabilityTimer);
+        this.captchaStabilityTimer = null;
       }
       if (this.restartWatchdogTimer) {
         clearTimeout(this.restartWatchdogTimer);
         this.restartWatchdogTimer = null;
       }
-      if (message) this.log(`⏹️ ${message}`);
+      for (const cancel of this.domWaiters || []) cancel();
+      this.domWaiters?.clear();
+      if (message) this.log(`automation.stop reason="${message}"`);
     }
 
     watchForAutomationPage() {
-      setInterval(() => this.resumeAutomation(), 350);
-      setTimeout(() => this.resumeAutomation(), 0);
+      const check = () => {
+        this.confirmRestartDialogIfPresent();
+        this.resumeAutomation();
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+      check();
     }
 
     resumeAutomation() {
-      if (!this.isAutomationActive() || !this.preset || this.isRunning || this.retryTimer) return;
+      if (!this.isAutomationActive() || !this.preset || this.isRunning ||
+          this.restartAttemptInFlight || this.retryDelayTimer) return;
 
       const captchaImage = this.findCaptchaImage();
       if (captchaImage && captchaImage.offsetParent !== null) {
+        this.restartConfirmationPending = false;
         this.automationWaitState = 'captcha';
         this.submitFilledCaptchaForAutomation(captchaImage);
         return;
@@ -373,6 +512,7 @@
       if (this.restartPending) {
         if (!serviceForm || serviceForm !== this.restartSourceForm) {
           this.restartPending = false;
+          this.restartConfirmationPending = false;
           this.restartSourceForm = null;
           this.stopWaiting = false;
           if (this.restartWatchdogTimer) {
@@ -385,6 +525,7 @@
       }
 
       if (serviceForm) {
+        this.restartConfirmationPending = false;
         this.automationWaitState = 'service';
         this.run();
       }
@@ -437,62 +578,91 @@
       this.submitCaptcha();
     }
 
-    restartAutomationCycle(reason = 'повтор') {
+    async restartAutomationCycle(reason = 'retry') {
       if (!this.preset) {
-        this.log('❌ Сначала загрузите пресет');
+        this.log('preset.required');
         return;
       }
       if (!this.isAutomationActive()) {
-        this.log('⏹️ Автоматизация остановлена. Ctrl+Shift+Z игнорируется; для запуска нажмите Ctrl+Shift+V');
+        this.log('cycle.restart_ignored reason=stopped');
         return;
       }
+      if (this.retryDelayTimer) {
+        clearTimeout(this.retryDelayTimer);
+        this.retryDelayTimer = null;
+      }
       this.stopWaiting = true;
-      if (this.retryTimer) clearTimeout(this.retryTimer);
+      if (this.restartAttemptInFlight) return;
       if (this.restartWatchdogTimer) {
         clearTimeout(this.restartWatchdogTimer);
         this.restartWatchdogTimer = null;
       }
-      this.log(`🔄 ${reason}: возвращаюсь к началу цикла...`);
-      this.retryTimer = setTimeout(() => {
-        this.retryTimer = null;
+      this.log(`cycle.restart reason="${reason}"`);
+      this.restartAttemptInFlight = true;
+      const link = await this.waitForDomState(() => {
+        const candidate = document.querySelector('a[href$="/wiza-krajowa"]');
+        return this.isElementVisible(candidate) ? candidate : null;
+      });
+      this.restartAttemptInFlight = false;
+      if (!link || !this.isAutomationActive()) return;
+
+      this.captchaCandidateSource = null;
+      this.captchaCandidateSince = 0;
+      this.restartSourceForm = this.getServiceSelectionForm();
+      this.restartPending = Boolean(this.restartSourceForm);
+      this.stopWaiting = true;
+      this.skipReload = true;
+      this.restartConfirmationPending = true;
+      this.log('cycle.open');
+      link.click();
+      this.confirmRestartDialogIfPresent();
+
+      if (!this.restartPending) {
+        this.stopWaiting = false;
+        return;
+      }
+      this.restartWatchdogTimer = setTimeout(() => {
+        this.restartWatchdogTimer = null;
         if (!this.isAutomationActive()) return;
-        this.captchaOcrNotBefore = Date.now() + 1000;
-        sessionStorage.setItem('visaCaptchaOcrNotBefore', String(this.captchaOcrNotBefore));
-        this.captchaCandidateSource = null;
-        this.captchaCandidateSince = 0;
-        this.restartSourceForm = this.getServiceSelectionForm();
-        this.restartPending = Boolean(this.restartSourceForm);
-        if (!this.clickWizaKrajowa()) {
+        if (this.restartPending && this.getServiceSelectionForm() === this.restartSourceForm) {
           this.restartPending = false;
+          this.restartSourceForm = null;
           this.stopWaiting = false;
-          this.log('⚠️ Не удалось найти ссылку Wiza krajowa; повторяю автоматически');
-          this.restartAutomationCycle('ссылка Wiza krajowa ещё не готова');
-        } else if (!this.restartPending) {
-          this.stopWaiting = false;
-        } else {
-          this.restartWatchdogTimer = setTimeout(() => {
-            this.restartWatchdogTimer = null;
-            if (!this.isAutomationActive()) return;
-            if (this.restartPending && this.getServiceSelectionForm() === this.restartSourceForm) {
-              this.restartPending = false;
-              this.restartSourceForm = null;
-              this.stopWaiting = false;
-              this.restartAutomationCycle('переход к новому циклу не завершился');
-            }
-          }, 3500);
+          this.restartAutomationCycle('navigation_stalled');
         }
-      }, 1100);
+      }, 3500);
+    }
+
+    scheduleAutomationRetry(reason) {
+      if (!this.isAutomationActive()) return;
+      if (!this.isIntervalRetryMode()) {
+        this.restartAutomationCycle(reason);
+        return;
+      }
+
+      const intervalMs = this.retryIntervalSeconds * 1000;
+      const elapsedMs = Math.max(0, Date.now() - this.attemptStartedAt);
+      const remainingMs = Math.max(0, intervalMs - elapsedMs);
+      if (remainingMs === 0) {
+        this.log(`retry.due seconds=${this.retryIntervalSeconds}`);
+        this.restartAutomationCycle(reason);
+        return;
+      }
+
+      this.stopWaiting = true;
+      this.log(`retry.wait seconds=${Math.ceil(remainingMs / 1000)} reason="${reason}"`);
+      this.retryDelayTimer = setTimeout(() => {
+        this.retryDelayTimer = null;
+        if (!this.isAutomationActive()) return;
+        this.restartAutomationCycle(reason);
+      }, remainingMs);
     }
 
     reloadAfterCaptchaError(reason) {
-      if (this.captchaReloadTimer || !this.isAutomationActive()) return;
-      this.captchaOcrNotBefore = Date.now() + 2500;
-      sessionStorage.setItem('visaCaptchaOcrNotBefore', String(this.captchaOcrNotBefore));
-      this.log(`🔄 ${reason}; перезагружаю страницу и беру новую капчу...`);
-      this.captchaReloadTimer = setTimeout(() => {
-        this.captchaReloadTimer = null;
-        if (this.isAutomationActive()) window.location.reload();
-      }, 900);
+      if (this.captchaReloadPending || !this.isAutomationActive()) return;
+      this.captchaReloadPending = true;
+      this.log(`page.reload reason="${reason}"`);
+      window.location.reload();
     }
 
     isAutomationActive() {
@@ -502,32 +672,33 @@
     async run() {
       if (this.isRunning) return;
       this.isRunning = true;
+      this.attemptStartedAt = Date.now();
 
       document.getElementById('visa-progress').style.display = 'block';
       document.getElementById('visa-run-btn').disabled = true;
 
       try {
-        this.updateProgress('Шаг 1/4: Выбор услуги...');
+        this.updateProgress('Шаг 1/4: Выбор услуги...', 'step.service');
         if (!await this.selectByIndex(0, this.preset.rodzajUslugi)) {
           throw new Error('Не удалось выбрать услугу');
         }
 
-        this.updateProgress('Шаг 2/4: Выбор локации...');
+        this.updateProgress('Шаг 2/4: Выбор локации...', 'step.location');
         if (!await this.selectByIndex(1, this.preset.lokalizacja)) {
           throw new Error('Не удалось выбрать локацию');
         }
 
-        this.updateProgress('Шаг 3/4: Выбор количества...');
+        this.updateProgress('Шаг 3/4: Выбор количества...', 'step.people');
         if (!await this.selectByIndex(2, this.preset.ludzie)) {
           throw new Error('Не удалось выбрать количество');
         }
 
-        this.updateProgress('Шаг 4/4: Выбор даты...');
+        this.updateProgress('Шаг 4/4: Выбор даты...', 'step.date');
         if (!await this.selectDate()) {
           throw new Error('Не удалось выбрать дату');
         }
 
-        this.log('🎯 Свободный слот выбран, автоматические повторы остановлены');
+        this.log('slot.confirmed');
         this.playSuccessSound();
         this.showNotification('🎯 Свободный слот найден!', 'success');
         if (typeof GM_notification === 'function') {
@@ -540,9 +711,9 @@
         this.stopAutomation();
       } catch (error) {
         if (this.isAutomationActive()) {
-          this.restartAutomationCycle(error.message);
+          this.scheduleAutomationRetry(error.message);
         } else {
-          this.log('❌ Ошибка: ' + error.message);
+          this.log(`error message="${error.message}"`);
           this.showNotification('❌ ' + error.message, 'error');
         }
       } finally {
@@ -552,36 +723,37 @@
       }
     }
 
-    updateProgress(text) {
+    updateProgress(text, event = text) {
       document.getElementById('visa-progress-text').textContent = text;
-      this.log(text);
+      this.log(event);
     }
 
     async selectByIndex(selectIndex, searchValue) {
-      const matSelects = document.querySelectorAll('mat-select');
-
-      if (selectIndex >= matSelects.length) {
-        return false;
-      }
-
-      const matSelect = matSelects[selectIndex];
-      matSelect.click();
-      let options = [];
-      while (options.length === 0) {
-        if (this.stopWaiting || !this.isAutomationActive()) return false;
+      const matSelect = await this.waitForDomState(() => {
+        if (this.stopWaiting || !this.isAutomationActive()) return null;
         const loadError = this.findReservationError();
         if (loadError) throw new Error(`форма не загрузилась: ${loadError}`);
-        options = [...document.querySelectorAll('mat-option[role="option"]')];
-        if (options.length === 0) await this.delay(80);
-      }
+        const candidate = document.querySelectorAll('mat-select')[selectIndex];
+        return this.isElementReady(candidate) ? candidate : null;
+      }, this.getAutomationWaitTimeout());
+      if (!matSelect) return false;
+      matSelect.click();
+      const options = await this.waitForDomState(() => {
+        if (this.stopWaiting || !this.isAutomationActive()) return null;
+        const loadError = this.findReservationError();
+        if (loadError) throw new Error(`форма не загрузилась: ${loadError}`);
+        const available = [...document.querySelectorAll('mat-option[role="option"]')];
+        return available.length ? available : null;
+      }, this.getAutomationWaitTimeout());
+      if (!options) return false;
 
       for (const option of options) {
         if (!this.isAutomationActive()) return false;
         const optionText = option.textContent.trim();
         if (optionText.toLowerCase().includes(searchValue.toLowerCase())) {
+          const applied = this.waitForSelectionApplied(matSelect, option, optionText);
           option.click();
-          await this.delay(110);
-          return true;
+          return Boolean(await applied);
         }
       }
 
@@ -589,25 +761,26 @@
     }
 
     async selectDate() {
-      const matSelects = document.querySelectorAll('mat-select');
-      const terminSelect = matSelects[3];
+      let terminSelect = document.querySelectorAll('mat-select')[3];
+
+      if (this.isIntervalRetryMode()) {
+        terminSelect = await this.waitForDomState(() => {
+          if (this.stopWaiting || !this.isAutomationActive()) return null;
+          const loadError = this.findReservationError();
+          if (loadError) throw new Error(`слоты не получены: ${loadError}`);
+          const candidate = document.querySelectorAll('mat-select')[3];
+          return this.isElementReady(candidate) ? candidate : null;
+        });
+      }
 
       if (!terminSelect) {
         return false;
       }
 
-      // Ждём загрузки дат
-      if (!await this.waitForDateOptions()) {
-        return false;
-      }
+      const options = await this.waitForDateOptions(terminSelect);
 
-      terminSelect.click();
-      await this.delay(200);
-
-      const options = this.getAvailableDateOptions();
-
-      if (options.length === 0) {
-        this.log('❌ Даты не загрузились');
+      if (!options || options.length === 0) {
+        this.log('date.options_missing');
         return false;
       }
 
@@ -622,10 +795,11 @@
           for (const option of options) {
             const optionText = option.textContent.trim();
             if (optionText.includes(dateToFind)) {
+              const applied = this.waitForSelectionApplied(terminSelect, option, optionText);
               option.click();
-              await this.delay(110);
-              this.log(`📅 Выбрана дата: ${optionText}`);
-              return await this.clickDalejButton();
+              if (!await applied) return false;
+              this.log(`date.selected value="${optionText}"`);
+              return await this.clickDalejButton(terminSelect);
             }
           }
         }
@@ -633,33 +807,67 @@
         const dateList = Array.isArray(this.preset.data)
           ? this.preset.data.join(', ')
           : this.preset.data;
-        this.log(`⚠️  Даты [${dateList}] не найдены, выбираю первую доступную`);
+        this.log(`date.preferred_missing values="${dateList}"`);
       }
 
       // Если даты нет в пресете или не найдена - выбрать первую
       if (options.length > 0) {
         const firstOption = options[0];
+        const optionText = firstOption.textContent.trim();
+        const applied = this.waitForSelectionApplied(terminSelect, firstOption, optionText);
         firstOption.click();
-        await this.delay(110);
-        this.log(`📅 Выбрана первая доступная: ${firstOption.textContent.trim()}`);
-        return await this.clickDalejButton();
+        if (!await applied) return false;
+        this.log(`date.selected value="${optionText}" source=first`);
+        return await this.clickDalejButton(terminSelect);
       }
 
       return false;
     }
 
-    async clickDalejButton() {
-      await this.delay(220);
+    async clickDalejButton(terminSelect) {
       if (!this.isAutomationActive()) return false;
-      const buttons = document.querySelectorAll('button[mat-button]');
-      for (const btn of buttons) {
-        if (btn.textContent.includes('Dalej')) {
-          this.log('✓ Нажимаю "Dalej"...');
-          btn.click();
-          await this.delay(400);
-          return true;
+      const button = await this.waitForDomState(() => {
+        const loadError = this.findReservationError();
+        if (loadError) throw new Error(`слот не подтверждён: ${loadError}`);
+        return this.findReadyDalejButton();
+      }, this.getAutomationWaitTimeout());
+      if (!button || !this.isAutomationActive()) return false;
+      this.log('dalej.click');
+      button.click();
+      return await this.waitForReservationSubmission(terminSelect);
+    }
+
+    async waitForReservationSubmission(terminSelect) {
+      this.log('reservation.verify');
+      let successCandidateSince = 0;
+
+      while (this.isAutomationActive() && !this.stopWaiting) {
+        const loadError = this.findReservationError();
+        if (loadError) {
+          throw new Error(`Termin не подтверждён сервером: ${loadError}`);
         }
+
+        const postReservationForm = this.getPostReservationForm();
+        if (!this.isElementVisible(terminSelect) && postReservationForm) {
+          if (!successCandidateSince) successCandidateSince = Date.now();
+          if (Date.now() - successCandidateSince >= 800) {
+            this.log('reservation.accepted');
+            return true;
+          }
+        } else {
+          successCandidateSince = 0;
+        }
+
+        await this.waitForDomState(() => {
+          if (this.stopWaiting || !this.isAutomationActive()) return true;
+          const currentError = this.findReservationError();
+          if (currentError) {
+            throw new Error(`Termin не подтверждён сервером: ${currentError}`);
+          }
+          return null;
+        }, 200);
       }
+
       return false;
     }
 
@@ -686,70 +894,87 @@
       if (source !== this.captchaCandidateSource) {
         this.captchaCandidateSource = source;
         this.captchaCandidateSince = Date.now();
+        if (this.captchaStabilityTimer) clearTimeout(this.captchaStabilityTimer);
+        this.captchaStabilityTimer = setTimeout(() => {
+          this.captchaStabilityTimer = null;
+          this.checkForCaptcha();
+        }, 750);
         return false;
       }
 
-      if (Date.now() < this.captchaOcrNotBefore) return false;
-      sessionStorage.removeItem('visaCaptchaOcrNotBefore');
       return Date.now() - this.captchaCandidateSince >= 750;
     }
 
     watchForCaptcha() {
-      setInterval(() => {
-        const captchaImage = this.findCaptchaImage();
+      const check = () => this.checkForCaptcha();
+      const observer = new MutationObserver(mutations => {
+        if (mutations.every(mutation => mutation.target.closest?.('#visa-automation-panel'))) return;
+        check();
+      });
+      observer.observe(document.body, {
+        attributes: true,
+        attributeFilter: ['src', 'class', 'style', 'aria-hidden'],
+        childList: true,
+        subtree: true,
+      });
+      document.addEventListener('load', check, true);
+      check();
+    }
 
-        let captchaInputField = document.querySelector('input[placeholder*="znaki"], input[placeholder*="obrazka"], input[placeholder*="capcha"], input[placeholder*="weryfi"]');
+    checkForCaptcha() {
+      const captchaImage = this.findCaptchaImage();
 
-        // Если не нашли поле - ищем input рядом с картинкой капчи
-        if (!captchaInputField && captchaImage) {
-          const form = captchaImage.closest('form') || captchaImage.closest('[role="form"]') || captchaImage.parentElement.parentElement;
-          if (form) {
-            captchaInputField = form.querySelector('input[type="text"]');
+      let captchaInputField = document.querySelector('input[placeholder*="znaki"], input[placeholder*="obrazka"], input[placeholder*="capcha"], input[placeholder*="weryfi"]');
+
+      // Если не нашли поле - ищем input рядом с картинкой капчи
+      if (!captchaInputField && captchaImage) {
+        const form = captchaImage.closest('form') || captchaImage.closest('[role="form"]') || captchaImage.parentElement.parentElement;
+        if (form) {
+          captchaInputField = form.querySelector('input[type="text"]');
+        }
+      }
+
+      // Если все еще не нашли - ищем любой text input после картинки
+      if (!captchaInputField && captchaImage) {
+        const allInputs = document.querySelectorAll('input[type="text"]');
+        for (const input of allInputs) {
+          if (input.offsetParent !== null) {
+            captchaInputField = input;
+            break;
           }
         }
+      }
 
-        // Если все еще не нашли - ищем любой text input после картинки
-        if (!captchaInputField && captchaImage) {
-          const allInputs = document.querySelectorAll('input[type="text"]');
-          for (const input of allInputs) {
-            if (input.offsetParent !== null) {
-              captchaInputField = input;
-              break;
-            }
+      const panel = document.getElementById('visa-captcha-panel');
+
+      if (captchaImage && captchaImage.src) {
+        const isVisible = captchaImage.offsetParent !== null;
+
+        if (isVisible && panel) {
+          panel.style.display = 'block';
+
+          const captchaImageElement = document.getElementById('visa-captcha-image');
+          const loadingElement = document.getElementById('visa-captcha-loading');
+
+          captchaImageElement.src = captchaImage.src;
+          captchaImageElement.style.display = 'block';
+          loadingElement.style.display = 'none';
+
+          if (captchaInputField &&
+              !this.manuallyStopped &&
+              this.isCaptchaStableForOcr(captchaImage) &&
+              captchaImage.src !== this.lastCaptchaSource &&
+              !this.captchaSolveInFlight) {
+            this.lastCaptchaSource = captchaImage.src;
+            this.solveCaptchaAutomatically(captchaImage, captchaInputField);
           }
+        } else if (!isVisible && panel) {
+          panel.style.display = 'none';
+          document.getElementById('visa-captcha-image').src = '';
+          document.getElementById('visa-captcha-image').style.display = 'none';
+          document.getElementById('visa-captcha-loading').style.display = 'block';
         }
-
-        const panel = document.getElementById('visa-captcha-panel');
-
-        if (captchaImage && captchaImage.src) {
-          const isVisible = captchaImage.offsetParent !== null;
-
-          if (isVisible && panel) {
-            panel.style.display = 'block';
-
-            const captchaImageElement = document.getElementById('visa-captcha-image');
-            const loadingElement = document.getElementById('visa-captcha-loading');
-
-            captchaImageElement.src = captchaImage.src;
-            captchaImageElement.style.display = 'block';
-            loadingElement.style.display = 'none';
-
-            if (captchaInputField &&
-                !this.manuallyStopped &&
-                this.isCaptchaStableForOcr(captchaImage) &&
-                captchaImage.src !== this.lastCaptchaSource &&
-                !this.captchaSolveInFlight) {
-              this.lastCaptchaSource = captchaImage.src;
-              this.solveCaptchaAutomatically(captchaImage, captchaInputField);
-            }
-          } else if (!isVisible && panel) {
-            panel.style.display = 'none';
-            document.getElementById('visa-captcha-image').src = '';
-            document.getElementById('visa-captcha-image').style.display = 'none';
-            document.getElementById('visa-captcha-loading').style.display = 'block';
-          }
-        }
-      }, 500);
+      }
     }
 
     async solveCaptchaAutomatically(captchaImage, captchaInputField) {
@@ -765,16 +990,16 @@
       if (focusButton) focusButton.disabled = true;
 
       try {
-        this.log('🔎 Отправляю новую капчу локальному relay...');
+        this.log('captcha.ocr_request');
         this.currentCaptchaSample = { image: source, predicted: '', taskId: null };
         const result = await this.requestCaptchaSolution(source);
 
         if (this.manuallyStopped) {
-          this.log('⏹️ Ответ OCR отброшен: автоматизация остановлена');
+          this.log('captcha.ocr_discarded reason=stopped');
           return;
         }
         if (!captchaImage.isConnected || captchaImage.src !== source || captchaImage.offsetParent === null) {
-          this.log('ℹ️ Капча уже изменилась, старый ответ пропущен');
+          this.log('captcha.ocr_discarded reason=stale');
           return;
         }
 
@@ -792,19 +1017,18 @@
         captchaInputField.focus();
 
         if (this.isAutomationActive() || (result.autoSubmit && !this.manuallyStopped)) {
-          this.log('✅ Капча распознана, отправляю форму');
+          this.log('captcha.ocr_ok');
           this.lastAutoSubmittedCaptcha = source;
-          await this.delay(250);
           await this.submitCaptcha();
         } else {
-          this.log('🔎 Капча заполнена — проверьте ответ и нажмите Enter');
+          this.log('captcha.manual_submit');
         }
       } catch (error) {
-        this.log(`⚠️ Автораспознавание не сработало: ${error.message}`);
+        this.log(`captcha.ocr_failed error="${error.message}"`);
         if (this.isAutomationActive()) {
-          this.reloadAfterCaptchaError('капча не распознана');
+          this.reloadAfterCaptchaError('captcha_failed');
         } else {
-          this.log('✏️ Можно ввести капчу вручную');
+          this.log('captcha.manual_required');
           captchaInputField.focus();
         }
       } finally {
@@ -868,14 +1092,14 @@
         taskId: sample.taskId,
         submittedAt: Date.now()
       }));
-      this.log('📚 Капча отправлена; жду подтверждения переходом к выбору услуги');
+      this.log('captcha.submitted');
     }
 
     watchForCaptchaSuccess() {
       const check = () => this.confirmCaptchaFeedbackIfSuccessful();
       const observer = new MutationObserver(check);
       observer.observe(document.body, { childList: true, subtree: true });
-      setTimeout(check, 0);
+      check();
     }
 
     resetCaptchaSuccessCandidate() {
@@ -913,7 +1137,7 @@
         if (captchaImage.src && captchaImage.src !== sample.image) {
           sessionStorage.removeItem('visaPendingCaptchaFeedback');
           this.reportedCaptchaSources.delete(sample.image);
-          this.log('📚 Капча отклонена сайтом — пример не сохранён');
+          this.log('captcha.rejected');
         }
         return;
       }
@@ -955,7 +1179,7 @@
           if (response.status >= 200 && response.status < 300) {
             sessionStorage.removeItem('visaPendingCaptchaFeedback');
             this.resetCaptchaSuccessCandidate();
-            this.log('📚 Сайт принял капчу — успешный пример сохранён');
+            this.log('captcha.accepted');
           } else {
             this.reportedCaptchaSources.delete(sample.image);
           }
@@ -967,26 +1191,20 @@
 
     async submitCaptcha() {
       if (this.manuallyStopped) {
-        this.log('⏹️ Отправка отменена: автоматизация остановлена');
+        this.log('submit.cancelled reason=stopped');
+        return;
+      }
+      const button = await this.waitForDomState(
+        () => this.findReadyDalejButton(),
+        5000,
+      );
+      if (!button || this.manuallyStopped) {
+        if (!this.manuallyStopped) this.log('dalej.not_ready');
         return;
       }
       this.stageCaptchaFeedback();
-      this.log('✓ Отправляю капчу...');
-      await this.delay(200);
-      if (this.manuallyStopped) return;
-
-      // Нажимаем Dalej
-      const buttons = document.querySelectorAll('button[mat-button]');
-      for (const btn of buttons) {
-        if (btn.textContent.includes('Dalej')) {
-          this.log('✓ Нажимаю "Dalej"...');
-          btn.click();
-          await this.delay(700);
-          return;
-        }
-      }
-
-      this.log('❌ Кнопка "Dalej" не найдена');
+      this.log('dalej.click');
+      button.click();
     }
 
     focusCaptchaInput() {
@@ -1012,9 +1230,9 @@
 
       if (captchaInputField) {
         captchaInputField.focus();
-        this.log('✏️ Фокус на поле капчи');
+        this.log('captcha.input_focus');
       } else {
-        this.log('❌ Поле капчи не найдено');
+        this.log('captcha.input_missing');
       }
     }
 
@@ -1024,13 +1242,46 @@
       if (link) {
         this.stopWaiting = true;
         this.skipReload = true;
-        this.log('🔗 Открываю Wiza krajowa для нового цикла...');
+        this.log('cycle.open');
         link.click();
         return true;
       } else {
-        this.log('❌ Ссылка "Wiza krajowa" не найдена');
+        this.log('cycle.link_missing');
         return false;
       }
+    }
+
+    findRestartConfirmationButton() {
+      const dialogs = document.querySelectorAll('mat-dialog-container[role="dialog"], mat-dialog-container');
+      for (const dialog of dialogs) {
+        if (!this.isElementVisible(dialog)) continue;
+        const text = String(dialog.textContent || '')
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .replace(/[łŁ]/g, 'l')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .toLowerCase();
+        const isCancellationDialog = /czy na pewno chcesz anulowac uzupelnianie formularza/.test(text) ||
+          /niezapisane dane zostana usuniete/.test(text);
+        if (!isCancellationDialog) continue;
+        const buttons = dialog.querySelectorAll('button[mat-button], button');
+        for (const button of buttons) {
+          const label = String(button.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+          if (label === 'tak' && this.isElementReady(button)) return button;
+        }
+      }
+      return null;
+    }
+
+    confirmRestartDialogIfPresent() {
+      if (!this.restartConfirmationPending || !this.isAutomationActive()) return false;
+      const button = this.findRestartConfirmationButton();
+      if (!button) return false;
+      this.restartConfirmationPending = false;
+      this.log('cycle.cancel_confirmed');
+      button.click();
+      return true;
     }
 
     isNoSlotsOrLoadError(text) {
@@ -1044,6 +1295,8 @@
       return /brak[^.]{0,50}(?:termin|dat|wolnych miejsc)/.test(value) ||
         /nie (?:ma|znaleziono)[^.]{0,80}(?:termin|dat|wolnych miejsc)/.test(value) ||
         this.isFullyBookedMessage(value) ||
+        this.isSlotUnavailableMessage(value) ||
+        this.isCommunicationServerError(value) ||
         /nie udalo sie/.test(value) ||
         /wystapil blad/.test(value) ||
         /sprobuj ponownie/.test(value) ||
@@ -1062,6 +1315,35 @@
       return /chwilowo wszystkie udostepnione terminy zostaly zarezerwowane/.test(value) ||
         /wszystkie[^.]{0,80}terminy[^.]{0,80}zarezerwowane/.test(value) ||
         /prosimy sprobowac[^.]{0,80}terminie pozniejszym/.test(value);
+    }
+
+    isSlotUnavailableMessage(text) {
+      const value = String(text || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[łŁ]/g, 'l')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+      return /(?:wybrany|ten) termin[^.]{0,80}niedostepn/.test(value) ||
+        /termin[^.]{0,80}nie (?:jest )?(?:juz )?dostepn/.test(value) ||
+        /termin[^.]{0,80}(?:jest |zostal )?juz (?:zarezerwowan|zajet)/.test(value) ||
+        /termin[^.]{0,80}(?:jest |zostal )?zajet/.test(value) ||
+        /termin[^.]{0,80}zarezerwowan[^.]{0,40}przez (?:inna|innego)/.test(value) ||
+        /nie mozna[^.]{0,80}(?:zarezerwowac|wybrac)[^.]{0,80}termin/.test(value) ||
+        /wybierz inny termin/.test(value);
+    }
+
+    isCommunicationServerError(text) {
+      const value = String(text || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[łŁ]/g, 'l')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+      return /blad komunikacji z serwerem/.test(value) ||
+        /blad polaczenia z serwerem/.test(value);
     }
 
     findReservationError() {
@@ -1083,6 +1365,12 @@
         if (text) visibleText.push(text);
       }
       const pageText = visibleText.join(' ');
+      if (this.isCommunicationServerError(pageText)) {
+        return 'Błąd komunikacji z serwerem';
+      }
+      if (this.isSlotUnavailableMessage(pageText)) {
+        return 'Wybrany termin jest już niedostępny';
+      }
       if (this.isFullyBookedMessage(pageText)) {
         return 'Chwilowo wszystkie udostępnione terminy zostały zarezerwowane';
       }
@@ -1096,24 +1384,9 @@
       });
     }
 
-    async waitForDateOptions() {
-      const matSelects = document.querySelectorAll('mat-select');
-      const terminSelect = matSelects[3];
-
-      if (!terminSelect) return false;
-
-      let attempts = 0;
-      this.log('⏳ Ожидаю доступные даты без ограничения времени и без перезагрузки...');
-      terminSelect.click();
-      await this.delay(100);
-
-      while (true) {
-        // Проверяем флаг прерывания
-        if (this.stopWaiting || !this.isAutomationActive()) {
-          this.log('⏹️  Ожидание прервано');
-          return false;
-        }
-
+    async waitForDateOptions(terminSelect) {
+      this.log('slots.wait');
+      while (this.isAutomationActive() && !this.stopWaiting) {
         const loadError = this.findReservationError();
         if (loadError) {
           throw new Error(`слоты не получены: ${loadError}`);
@@ -1121,25 +1394,116 @@
 
         const options = this.getAvailableDateOptions();
         if (options.length > 0) {
-          terminSelect.click(); // закрыть после проверки
-          await this.delay(100);
-          this.log(`✓ Даты загружены (${options.length} вариантов)`);
-          return true;
+          this.log(`slots.available count=${options.length}`);
+          return options;
         }
 
-        attempts++;
-        if (attempts % 4 === 0 && terminSelect.getAttribute('aria-expanded') !== 'true') {
+        if (this.isElementReady(terminSelect) &&
+            terminSelect.getAttribute('aria-expanded') !== 'true') {
           terminSelect.click();
         }
-        if (attempts % 120 === 0) {
-          this.log('⏳ Страница ещё загружается; жду слоты или сообщение об ошибке...');
+
+        const observedOptions = await this.waitForDomState(() => {
+          if (this.stopWaiting || !this.isAutomationActive()) return true;
+          const currentError = this.findReservationError();
+          if (currentError) throw new Error(`слоты не получены: ${currentError}`);
+          const currentOptions = this.getAvailableDateOptions();
+          return currentOptions.length > 0 ? currentOptions : null;
+        }, 500);
+
+        if (Array.isArray(observedOptions)) {
+          this.log(`slots.available count=${observedOptions.length}`);
+          return observedOptions;
         }
-        await this.delay(180);
       }
+
+      if (this.stopWaiting || !this.isAutomationActive()) {
+        this.log('slots.wait_cancelled');
+      }
+      return null;
     }
 
-    delay(ms) {
-      return new Promise(resolve => setTimeout(resolve, ms));
+    getPostReservationForm() {
+      if (this.getServiceSelectionForm()) return null;
+      const forms = document.querySelectorAll('form');
+      for (const form of forms) {
+        if (!this.isElementVisible(form) || form.closest?.('#visa-automation-panel')) continue;
+        const hasVisibleCaptcha = [...form.querySelectorAll(
+          'img[alt="Weryfikacja obrazkowa"], img[alt*="Weryfikacja"]'
+        )].some(image => this.isElementVisible(image));
+        if (hasVisibleCaptcha) continue;
+        const usableFields = [...form.querySelectorAll(
+          'input:not([type="hidden"]), textarea, mat-select'
+        )].filter(field => this.isElementReady(field));
+        if (usableFields.length > 0) return form;
+      }
+      return null;
+    }
+
+    isElementReady(element) {
+      return this.isElementVisible(element) &&
+        element.disabled !== true &&
+        element.getAttribute?.('disabled') === null &&
+        element.getAttribute?.('aria-disabled') !== 'true';
+    }
+
+    isSelectionApplied(matSelect, option, optionText) {
+      if (matSelect.getAttribute('aria-expanded') === 'true') return null;
+      const selectedText = String(matSelect.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const expectedText = String(optionText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      return option.isConnected === false && selectedText.includes(expectedText) ? true : null;
+    }
+
+    waitForSelectionApplied(matSelect, option, optionText) {
+      return this.waitForDomState(() => {
+        const loadError = this.findReservationError();
+        if (loadError) throw new Error(`выбор не применён: ${loadError}`);
+        return this.isSelectionApplied(matSelect, option, optionText);
+      }, this.getAutomationWaitTimeout());
+    }
+
+    findReadyDalejButton(root = document) {
+      return [...root.querySelectorAll('button[mat-button]')]
+        .find(button => button.textContent.includes('Dalej') && this.isElementReady(button)) || null;
+    }
+
+    waitForDomState(check, timeoutMs = 0) {
+      return new Promise((resolve, reject) => {
+        let observer = null;
+        let timeout = null;
+        let settled = false;
+
+        const finish = (value, error = null) => {
+          if (settled) return;
+          settled = true;
+          observer?.disconnect();
+          if (timeout) clearTimeout(timeout);
+          this.domWaiters?.delete(cancel);
+          if (error) reject(error);
+          else resolve(value);
+        };
+        const cancel = () => finish(null);
+        const evaluate = () => {
+          try {
+            const value = check();
+            if (value) finish(value);
+          } catch (error) {
+            finish(null, error);
+          }
+        };
+
+        this.domWaiters ??= new Set();
+        this.domWaiters.add(cancel);
+        observer = new MutationObserver(evaluate);
+        observer.observe(document.body, {
+          attributes: true,
+          childList: true,
+          characterData: true,
+          subtree: true,
+        });
+        if (timeoutMs > 0) timeout = setTimeout(cancel, timeoutMs);
+        evaluate();
+      });
     }
 
     armSuccessSound() {
@@ -1217,14 +1581,10 @@
   function initVisa() {
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', () => {
-        setTimeout(() => {
-          window.visaBot = new VisaAutomationUI();
-        }, 500);
+        window.visaBot = new VisaAutomationUI();
       });
     } else {
-      setTimeout(() => {
-        window.visaBot = new VisaAutomationUI();
-      }, 500);
+      window.visaBot = new VisaAutomationUI();
     }
   }
 

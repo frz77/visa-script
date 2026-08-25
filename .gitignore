@@ -9,3 +9,4 @@ node_modules/
 .proxy-profiles.json
 __pycache__/
 *.pyc
+logs/*.log

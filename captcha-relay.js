@@ -10,6 +10,7 @@ loadEnv(ENV_PATH);
 
 const HOST = '127.0.0.1';
 const DATASET_DIR = path.join(__dirname, 'captcha-dataset');
+const LOG_DIR = path.join(__dirname, 'logs');
 const PORT = Number(process.env.CAPTCHA_RELAY_PORT || 3210);
 const MAX_BODY_BYTES = 160_000;
 const MAX_IMAGE_BYTES = 50_000;
@@ -228,6 +229,40 @@ function saveCaptchaFeedback(body) {
   return { hash, correct: record.correct };
 }
 
+function saveSessionLog(body, logDir = LOG_DIR) {
+  const sessionId = String(body.sessionId || '').trim();
+  if (!/^[A-Za-z0-9_-]{1,80}$/.test(sessionId)) {
+    throw Object.assign(new Error('Invalid log session ID'), { statusCode: 400 });
+  }
+
+  const message = String(body.message || '').replace(/[\r\n]+/g, ' ').trim();
+  if (!message || message.length > 4000) {
+    throw Object.assign(new Error('Log message must contain 1-4000 characters'), { statusCode: 400 });
+  }
+
+  const timestamp = new Date(body.timestamp);
+  if (Number.isNaN(timestamp.getTime())) {
+    throw Object.assign(new Error('Invalid log timestamp'), { statusCode: 400 });
+  }
+  const requestedDisplayTime = String(body.displayTime || '').trim();
+  const displayTime = /^\d{1,2}:\d{2}:\d{2}$/.test(requestedDisplayTime)
+    ? requestedDisplayTime
+    : timestamp.toLocaleTimeString('ru-RU');
+
+  fs.mkdirSync(logDir, { recursive: true });
+  const fileName = `visa-session-${sessionId}.log`;
+  const filePath = path.join(logDir, fileName);
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(
+      filePath,
+      `Visa automation session: ${sessionId}\nStarted: ${timestamp.toISOString()}\nFormat: compact-v1\n\n`,
+      'utf8',
+    );
+  }
+  fs.appendFileSync(filePath, `[${displayTime}] ${message}\n`, 'utf8');
+  return { file: fileName };
+}
+
 async function solveDeduplicated(image, expectedLength) {
   const { base64, bytes } = normalizeImage(image);
   const hash = crypto.createHash('sha256').update(bytes).digest('hex');
@@ -287,6 +322,14 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'POST' && req.url === '/log') {
+      assertAllowedRequest(req);
+      const body = await readJson(req);
+      const log = saveSessionLog(body);
+      jsonResponse(res, 200, { ok: true, ...log });
+      return;
+    }
+
     if (req.method === 'POST' && req.url === '/feedback') {
       assertAllowedRequest(req);
       const body = await readJson(req);
@@ -318,9 +361,13 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Captcha relay listening on http://${HOST}:${PORT}`);
-  console.log('Local-only mode; duplicate images are cached for 2 minutes');
-  console.log(`PaddleOCR: ${PADDLE_OCR_ENABLED ? `enabled (min confidence ${PADDLE_OCR_MIN_CONFIDENCE})` : 'disabled'}`);
-  console.log(`CAPTCHA auto-submit outside userscript automation: ${AUTO_SUBMIT ? 'enabled' : 'disabled'}`);
-});
+if (require.main === module) {
+  server.listen(PORT, HOST, () => {
+    console.log(`Captcha relay listening on http://${HOST}:${PORT}`);
+    console.log('Local-only mode; duplicate images are cached for 2 minutes');
+    console.log(`PaddleOCR: ${PADDLE_OCR_ENABLED ? `enabled (min confidence ${PADDLE_OCR_MIN_CONFIDENCE})` : 'disabled'}`);
+    console.log(`CAPTCHA auto-submit outside userscript automation: ${AUTO_SUBMIT ? 'enabled' : 'disabled'}`);
+  });
+}
+
+module.exports = { saveSessionLog };
